@@ -1,0 +1,15 @@
+{
+  "name": "sitefuse-agency",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "tailwindcss --input ./assets/css/tailwind.css --output ./dist/tailwind.css --minify",
+    "watch": "tailwindcss --input ./assets/css/tailwind.css --output ./dist/tailwind.css --watch"
+  },
+  "devDependencies": {
+    "tailwindcss": "^4.1.11",
+    "@tailwindcss/cli": "^4.1.11",
+    "postcss": "^8.5.6",
+    "autoprefixer": "^10.4.21"
+  }
+}

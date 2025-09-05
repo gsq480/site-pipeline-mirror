@@ -1,0 +1,78 @@
+name: Mirror safe files
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Prepare mirror directory
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE"
+          echo "PWD: $(pwd)"
+          ls -la
+
+          # verify whitelist exists in repo root
+          test -f mirror.paths || { echo "mirror.paths missing in $(pwd)"; exit 1; }
+
+          echo "------ mirror.paths ------"
+          nl -ba mirror.paths
+
+          mkdir -p mirror
+
+          # copy whitelist, preserving relative paths, skipping blanks/comments
+          while IFS= read -r path || [ -n "$path" ]; do
+            path="$(echo "$path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$path" ] && continue
+            case "$path" in \#*) continue ;; esac
+            if [ -e "$path" ]; then
+              rsync -a --relative "$path" mirror/
+            else
+              echo "WARN: not found -> $path" >&2
+            fi
+          done < mirror.paths
+
+          # optional prune
+          if [ -f mirror.prune ]; then
+            echo "------ mirror.prune ------"
+            nl -ba mirror.prune
+            while IFS= read -r pat || [ -n "$pat" ]; do
+              pat="$(echo "$pat" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+              [ -z "$pat" ] && continue
+              case "$pat" in \#*) continue ;; esac
+              find mirror -path "$pat" -print -delete || true
+            done < mirror.prune
+          fi
+
+          echo "Source: $GITHUB_REPOSITORY@$GITHUB_SHA" > mirror/PROVENANCE.txt
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.MIRROR_DEPLOY_KEY }}
+
+      - name: Push to public mirror repo
+        env:
+          MIRROR_REPO: ${{ vars.MIRROR_REPO }}
+        run: |
+          set -euo pipefail
+          cd mirror
+          git init
+          git config user.name "CI Mirror"
+          git config user.email "ci-mirror@users.noreply.github.com"
+          git add .
+          git commit -m "Mirror $(date -u +%F) from $GITHUB_SHA"
+          git branch -M main
+          git remote add origin "$MIRROR_REPO"
+          git push -f origin main

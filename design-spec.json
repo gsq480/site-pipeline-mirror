@@ -1,0 +1,30 @@
+{
+  "pages": [
+    {
+      "title": "HERO",
+      "slug": "hero",
+      "blocks": [
+        {
+          "name": "block/hero",
+          "title": "Example",
+          "subtitle": "",
+          "width": 1200,
+          "height": 600
+        }
+      ]
+    },
+    {
+      "title": "TESTIMONIALS",
+      "slug": "testimonials",
+      "blocks": [
+        {
+          "name": "block/testimonials",
+          "title": "Example",
+          "subtitle": "",
+          "width": 1200,
+          "height": 600
+        }
+      ]
+    }
+  ]
+}
