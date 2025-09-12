@@ -1,0 +1,269 @@
+# .github/workflows/main-provision-freeform.yml
+name: Create Website Freeform
+# bump sha to pick latest called workflows
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Describe your website in your own words'
+        required: true
+        type: string
+      industry:
+        description: 'Industry (optional)'
+        required: false
+        type: string
+        default: 'auto-detect'
+      generate_images:
+        description: 'Generate AI images (ignored in freeform if incompatible)'
+        required: false
+        default: false
+        type: boolean
+      generate_preview:
+        description: 'Generate a simple preview artifact (HTML) before deploy'
+        required: false
+        default: false
+        type: boolean
+      deploy:
+        description: 'Deploy after build'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sitefuse-freeform-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    name: Generate Configuration (Freeform)
+    uses: ./.github/workflows/01-ai-generate.yml
+    with:
+      prompt: ${{ inputs.prompt }}
+      industry: ${{ inputs.industry }}
+      generate_images: ${{ inputs.generate_images }}
+      freeform: true
+    secrets: inherit
+
+  build:
+    name: Build Theme
+    needs: [generate, figma_sync_summary]
+    uses: ./.github/workflows/02-build-theme.yml
+    with:
+      config_artifact: ${{ needs.generate.outputs.config_artifact }}
+      strict_mode: 'false'
+      generate_logo: false
+    secrets: inherit
+
+  figma_sync:
+    name: Refresh Figma Spec
+    needs: generate
+    uses: ./.github/workflows/00-figma-sync.yml
+    secrets: inherit
+
+  figma_sync_summary:
+    name: Figma Refresh Summary
+    needs: figma_sync
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Append summary
+        run: |
+          echo "### Figma spec refreshed (design-spec.json)" >> $GITHUB_STEP_SUMMARY
+
+  preview:
+    name: Build Preview (optional)
+    needs: [generate, build]
+    if: ${{ inputs.generate_preview }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download config artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.generate.outputs.config_artifact }}
+      - name: Generate preview HTML
+        run: |
+          set -euo pipefail
+          mkdir -p preview
+          TITLE=$(jq -r '.name // "Site"' website.json)
+          TAGLINE=$(jq -r '.tagline // ""' website.json)
+          cat > preview/index.html << 'HTML'
+          <!doctype html>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>SiteFuse Preview</title>
+          <style>
+            body{font-family:system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; padding:24px; line-height:1.5}
+            .page{margin:24px 0; padding:16px; border:1px solid #eee; border-radius:12px}
+            h1{margin:0 0 8px}
+            h2{margin:16px 0 8px}
+            ul{margin:0; padding-left:20px}
+          </style>
+          <div id="app"></div>
+          <script>
+          fetch('website.json').then(r=>r.json()).then(d=>{
+            const el=document.getElementById('app');
+            el.innerHTML = `<h1>${d.name||'Site'}</h1><p>${d.tagline||''}</p>` +
+              (Array.isArray(d.pages)? d.pages.map(p => `<div class=page><h2>${p.title||p.slug}</h2><ul>` + (p.blocks||[]).map(b=>`<li>${b.type||b.name||'block'}</li>`).join('') + '</ul></div>').join('') : '');
+          });
+          </script>
+          HTML
+      - name: Upload preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-${{ github.run_id }}
+          path: |
+            website.json
+            preview/
+
+  commit:
+    name: Commit website.json only
+    needs: [generate, build]
+    runs-on: ubuntu-latest
+    outputs:
+      slug: ${{ steps.extract.outputs.slug }}
+      name: ${{ steps.extract.outputs.name }}
+      tagline: ${{ steps.extract.outputs.tagline }}
+      commit_sha: ${{ steps.commit_out.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download config artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.generate.outputs.config_artifact }}
+      - name: Sanity check website.json
+        run: |
+          test -s website.json || { echo "website.json missing"; exit 1; }
+          jq '.' website.json >/dev/null
+      - name: Extract values for output
+        id: extract
+        run: |
+          echo "slug=$(jq -r '.slug // "business-site"' website.json)" >> $GITHUB_OUTPUT
+          echo "name=$(jq -r '.name // "Your Business"' website.json)" >> $GITHUB_OUTPUT
+          echo "tagline=$(jq -r '.tagline // "Professional services"' website.json)" >> $GITHUB_OUTPUT
+      - name: Commit website.json (rebase + retry)
+        id: commit_out
+        env:
+          PROMPT_TEXT: ${{ inputs.prompt }}
+          NAME: ${{ steps.extract.outputs.name }}
+        run: |
+          git config user.name  "SiteFuse AI Bot"
+          git config user.email "ai-bot@sitefuse.com"
+          git add website.json || true
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            echo "sha=" >> $GITHUB_OUTPUT
+          else
+            git commit -m "feat(freeform): AI website config for '${NAME}' from prompt: ${PROMPT_TEXT}"
+            n=0
+            until [ "$n" -ge 4 ]; do
+              git fetch origin main || true
+              git pull --rebase origin main || true
+              if git push origin HEAD:main; then break; fi
+              n=$((n+1)); echo "Push failed, retry $n/3 after rebase"; sleep 2;
+            done
+            echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+  deploy:
+    name: Deploy to Server
+    needs: [generate, build, commit]
+    if: ${{ inputs.deploy }}
+    uses: ./.github/workflows/03-deploy.yml
+    with:
+      theme_artifact: theme-${{ needs.commit.outputs.slug }}-${{ github.run_id }}
+      slug:    ${{ needs.commit.outputs.slug }}
+      name:    ${{ needs.commit.outputs.name }}
+      tagline: ${{ needs.commit.outputs.tagline }}
+    secrets: inherit
+
+  n8n_webhook:
+    name: Notify n8n webhook (freeform)
+    needs: [generate, commit, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download config artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.generate.outputs.config_artifact }}
+      - name: Notify n8n webhook (freeform)
+        run: |
+          if [ -z "${{ secrets.N8N_WEBHOOK_URL }}" ]; then
+            echo "::notice::N8N_WEBHOOK_URL not set; skipping notification"; exit 0;
+          fi
+          set -euo pipefail
+          test -s website.json
+          PAYLOAD=$(jq -c --arg site "${{ secrets.SITE_URL }}" \
+                         --arg repo "${{ github.repository }}" \
+                         '. as $w | {site_url:$site, repo:$repo, website:$w}' website.json)
+          echo "::notice::Posting website.json to ${{ secrets.N8N_WEBHOOK_URL }}"
+          curl -sS -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            --data-raw "$PAYLOAD"
+
+  cleanup:
+    name: Cleanup Artifacts
+    needs: [generate, build, commit]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete temporary artifacts
+        uses: geekyeggo/delete-artifact@v2
+        with:
+          name: |
+            ${{ needs.generate.outputs.config_artifact }}
+            theme-${{ needs.commit.outputs.slug }}-${{ github.run_id }}
+          useGlob: true
+          failOnError: false
+
+  summary:
+    name: Run Summary
+    needs: [generate, figma_sync, build, commit, n8n_webhook]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Append summary
+        env:
+          PROMPT: ${{ inputs.prompt }}
+          CFG_ART: ${{ needs.generate.outputs.config_artifact }}
+          SHA: ${{ needs.commit.outputs.commit_sha }}
+        run: |
+          echo "## SiteFuse Freeform Provision Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Prompt: ${PROMPT:0:120}" >> $GITHUB_STEP_SUMMARY
+          echo "- Config Artifact: ${CFG_ART}" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$SHA" ]; then
+            echo "- Commit: https://github.com/${GITHUB_REPOSITORY}/commit/${SHA}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- Commit: (no changes)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- n8n: $( [ -n "${{ secrets.N8N_WEBHOOK_URL }}" ] && echo "notified" || echo "skipped (no secret)")" >> $GITHUB_STEP_SUMMARY
+
+      - name: Download run summaries
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: run-summary-*-${{ github.run_id }}
+          merge-multiple: true
+          path: run-summary
+        continue-on-error: true
+
+      - name: Append diagnostics
+        if: always()
+        run: |
+          if [ -f run-summary/ai.json ]; then
+            echo "\n### AI Generation" >> $GITHUB_STEP_SUMMARY
+            jq -r 'to_entries[] | "- \(.key): \(.value|tostring)"' run-summary/ai.json | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY || true
+          fi
+          if [ -f run-summary/build.json ]; then
+            echo "\n### Theme Build" >> $GITHUB_STEP_SUMMARY
+            jq -r 'to_entries[] | "- \(.key): \(.value|tostring)"' run-summary/build.json | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY || true
+          fi
+          if [ -f run-summary/deploy.json ]; then
+            echo "\n### Deployment" >> $GITHUB_STEP_SUMMARY
+            jq -r 'to_entries[] | "- \(.key): \(.value|tostring)"' run-summary/deploy.json | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY || true
+          fi

@@ -1,0 +1,165 @@
+name: Sync Blocks from Figma
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-blocks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- Fetch components from Figma ---
+      - name: Fetch components from Figma
+        env:
+          FIGMA_TOKEN: ${{ secrets.FIGMA_TOKEN }}
+          FILE_KEY: ${{ secrets.FIGMA_FILE_KEY }}
+        run: |
+          curl -sS -H "X-Figma-Token: $FIGMA_TOKEN" \
+            "https://api.figma.com/v1/files/$FILE_KEY/components" \
+            -o figma-components.json
+
+      # --- Build blocks-config.json from Figma components ---
+      - name: Build blocks-config.json
+        run: |
+          jq '
+            {
+              version: 1,
+              blocks: (
+                .meta.components
+                | map(select(.name | startswith("block/")))
+                | map({
+                    type: (.name | sub("^block/"; "")),
+                    label: .name,
+                    category: (
+                      if (.name | test("hero"; "i")) then "hero"
+                      elif (.name | test("about|story|mission"; "i")) then "about"
+                      elif (.name | test("feature|benefit|highlights"; "i")) then "features"
+                      elif (.name | test("service|offering|solutions"; "i")) then "services"
+                      elif (.name | test("testimonial|review|quotes"; "i")) then "testimonials"
+                      elif (.name | test("logo|brand|social-proof|clients|partners"; "i")) then "social-proof"
+                      elif (.name | test("cta|call-to-action|promo"; "i")) then "cta"
+                      elif (.name | test("contact|form|inquiry"; "i")) then "contact"
+                      elif (.name | test("pricing|plans|packages|tiers"; "i")) then "pricing"
+                      elif (.name | test("team|people|staff|experts"; "i")) then "team"
+                      elif (.name | test("gallery|portfolio|work|case-?stud"; "i")) then "gallery"
+                      elif (.name | test("faq|questions"; "i")) then "faq"
+                      elif (.name | test("blog|articles|posts|news"; "i")) then "blog"
+                      elif (.name | test("stats|metrics|numbers|kpi"; "i")) then "stats"
+                      elif (.name | test("process|how-?it-?works|steps"; "i")) then "process"
+                      elif (.name | test("locations|offices|stores|hours"; "i")) then "locations"
+                      elif (.name | test("menu|dishes|food|drinks"; "i")) then "menu"
+                      elif (.name | test("classes|schedule|timetable"; "i")) then "classes"
+                      elif (.name | test("map|location"; "i")) then "map"
+                      elif (.name | test("video|background-video"; "i")) then "video"
+                      elif (.name | test("newsletter|signup|subscribe"; "i")) then "newsletter"
+                      elif (.name | test("two-?col"; "i")) then "two-col"
+                      elif (.name | test("three-?col"; "i")) then "three-col"
+                      elif (.name | test("full-?width-?text|longform"; "i")) then "full-width-text"
+                      elif (.name | test("product|listing|catalogue|catalog"; "i")) then "products"
+                      else "misc" end
+                    ),
+                    supports_images: true,
+                    industries: ["all"],
+                    inputs: { title: "text", subtitle: "text" },
+                    defaults: { title: "Example", subtitle: "" },
+                    id: .node_id,
+                    key: .key,
+                    type_source: "figma-component"
+                  })
+              )
+            }
+          ' figma-components.json > blocks-config.json
+
+      # --- Build grouped design-spec.json for the plugin ---
+      - name: Build grouped design-spec.json
+        run: |
+          jq '
+            {
+              pages: (
+                .blocks
+                | group_by(.category)
+                | map({
+                    title: (.[0].category | gsub("-"; " ") | ascii_upcase),
+                    slug: (.[0].category),
+                    blocks: map({
+                      name: ("block/" + .type),
+                      title: .defaults.title,
+                      subtitle: .defaults.subtitle,
+                      width: 1200,
+                      height: 600
+                    })
+                  })
+              )
+            }
+          ' blocks-config.json > design-spec.json
+
+      # --- Commit changes if any ---
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add blocks-config.json design-spec.json || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: sync blocks-config.json + grouped design-spec.json from Figma"
+            git push
+          fi
+
+      # --- Early publish to WordPress uploads for Figma (optional) ---
+      - name: Publish design-spec.json to WP uploads (for Figma)
+        env:
+          CLOUDWAYS_HOST: ${{ secrets.CLOUDWAYS_HOST }}
+          CLOUDWAYS_USER: ${{ secrets.CLOUDWAYS_USER }}
+          CLOUDWAYS_KEY:  ${{ secrets.CLOUDWAYS_KEY }}
+          APP_PATH:       ${{ secrets.APP_PATH }}
+          SITEFUSE_WP_ORIGIN: ${{ vars.SITEFUSE_WP_ORIGIN }}
+        run: |
+          set -e
+          if [ ! -f design-spec.json ]; then
+            echo "design-spec.json not found; skipping publish"
+            exit 0
+          fi
+          # Skip if secrets are not configured
+          if [ -z "${CLOUDWAYS_HOST}" ] || [ -z "${CLOUDWAYS_USER}" ] || [ -z "${CLOUDWAYS_KEY}" ] || [ -z "${APP_PATH}" ]; then
+            echo "CLOUDWAYS_* or APP_PATH not set; skipping publish"
+            exit 0
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "$CLOUDWAYS_KEY" > ~/.ssh/id_rsa_cloudways
+          chmod 600 ~/.ssh/id_rsa_cloudways
+          ssh-keyscan -H "$CLOUDWAYS_HOST" >> ~/.ssh/known_hosts
+          # Upload via SSH pipe (more robust than scp when paths/dirs are tricky)
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no \
+            "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+            "mkdir -p \"$APP_PATH/wp-content/uploads/sitefuse\" && cat > \"$APP_PATH/wp-content/uploads/sitefuse/design-spec.json\"" < design-spec.json
+          # Ensure CORS headers for JSON in uploads/sitefuse
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no \
+            "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" "APP_PATH='${APP_PATH}' bash -s" <<'EOSSH'
+          set -e
+          mkdir -p "$APP_PATH/wp-content/uploads/sitefuse"
+          HTACCESS_PATH="$APP_PATH/wp-content/uploads/sitefuse/.htaccess"
+          cat > "$HTACCESS_PATH" <<'EOFHT'
+          <IfModule mod_headers.c>
+            <FilesMatch "\\.(json)$">
+              Header set Access-Control-Allow-Origin "*"
+              Header set Access-Control-Allow-Methods "GET, OPTIONS"
+              Header set Access-Control-Allow-Headers "Content-Type"
+            </FilesMatch>
+          </IfModule>
+          EOFHT
+          chmod 644 "$HTACCESS_PATH" || true
+          EOSSH
+          # Verify on remote
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no \
+            "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+            "ls -l \"$APP_PATH/wp-content/uploads/sitefuse/design-spec.json\" \"$APP_PATH/wp-content/uploads/sitefuse/.htaccess\" || true"
+          echo "## Figma design-spec.json (early publish)" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$SITEFUSE_WP_ORIGIN" ]; then
+            echo "https://$SITEFUSE_WP_ORIGIN/wp-content/uploads/sitefuse/design-spec.json" >> $GITHUB_STEP_SUMMARY
+          fi
