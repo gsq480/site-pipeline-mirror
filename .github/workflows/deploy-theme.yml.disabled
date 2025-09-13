@@ -1,0 +1,72 @@
+name: Deploy Theme to Cloudways
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cloudways-deploy
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node (for Tailwind build)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install deps and build Tailwind
+        run: |
+          npm ci || npm install
+          npx tailwindcss --input ./assets/css/tailwind.css --output ./dist/tailwind.css --minify
+          ls -lh dist/tailwind.css
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.CLOUDWAYS_SSH_KEY }}" > ~/.ssh/id_rsa_cloudways
+          chmod 600 ~/.ssh/id_rsa_cloudways
+          ssh-keyscan -H "${{ secrets.CLOUDWAYS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Ensure destination exists
+        env:
+          HOST: ${{ secrets.CLOUDWAYS_HOST }}
+          USER: ${{ secrets.CLOUDWAYS_USER }}
+        run: |
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" 'mkdir -p "/home/1504475.cloudwaysapps.com/zhudbfctnw/public_html/wp-content/themes/sitefuse-agency"'
+
+      - name: Rsync theme to Cloudways
+        env:
+          HOST: ${{ secrets.CLOUDWAYS_HOST }}
+          USER: ${{ secrets.CLOUDWAYS_USER }}
+        run: |
+          SRC="./"   # repo root IS the theme
+          DEST="/home/1504475.cloudwaysapps.com/zhudbfctnw/public_html/wp-content/themes/sitefuse-agency/"
+          rsync -rlvz --delete \
+            --exclude ".git/" --exclude ".github/" --exclude "node_modules/" --exclude ".DS_Store" \
+            --no-perms --no-owner --no-group --omit-dir-times --no-times \
+            -e "ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no -o BatchMode=yes" \
+            "$SRC" "$CLOUDWAYS_USER@$CLOUDWAYS_HOST:$DEST"
+
+      - name: Activate theme and flush cache
+        env:
+          HOST: ${{ secrets.CLOUDWAYS_HOST }}
+          USER: ${{ secrets.CLOUDWAYS_USER }}
+        run: |
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" '
+            cd /home/1504475.cloudwaysapps.com/zhudbfctnw/public_html &&
+            wp theme activate sitefuse-agency --allow-root || true &&
+            wp cache flush --allow-root || true &&
+            wp theme status --allow-root
+          '

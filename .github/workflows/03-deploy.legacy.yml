@@ -1,0 +1,998 @@
+# .github/workflows/03-deploy.yml
+name: Deploy Theme
+
+on:
+  workflow_dispatch:
+    inputs:
+      theme_artifact:
+        description: 'Theme artifact name (theme-<slug>-<run_id>)'
+        required: true
+        type: string
+      slug:
+        description: 'Theme slug'
+        required: true
+        type: string
+      name:
+        description: 'Site name'
+        required: true
+        type: string
+      tagline:
+        description: 'Site tagline'
+        required: true
+        type: string
+      publish_spec:
+        description: 'Publish design-spec.json to WP uploads for Figma'
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      theme_artifact: { required: true, type: string }
+      slug:           { required: true, type: string }
+      name:           { required: true, type: string }
+      tagline:        { required: true, type: string }
+      publish_spec:   { required: false, type: boolean, default: true }
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDWAYS_HOST: ${{ secrets.CLOUDWAYS_HOST }}
+      CLOUDWAYS_USER: ${{ secrets.CLOUDWAYS_USER }}
+      CLOUDWAYS_KEY:  ${{ secrets.CLOUDWAYS_KEY }}
+      APP_PATH:       ${{ secrets.APP_PATH }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download built theme
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.theme_artifact }}
+          path: theme-files/
+
+      - name: Fallback – download config artifact if website.json missing
+        uses: actions/download-artifact@v4
+        with:
+          name: website-config-${{ github.run_id }}
+          path: config-artifact/
+        continue-on-error: true
+
+      - name: Ensure website.json is available
+        run: |
+          set -e
+          if [ -f theme-files/website.json ]; then
+            echo "website.json found in theme artifact"
+          elif [ -f config-artifact/website.json ]; then
+            mkdir -p theme-files
+            cp config-artifact/website.json theme-files/website.json
+            echo "website.json copied from config artifact"
+          elif [ -f website.json ]; then
+            mkdir -p theme-files
+            cp website.json theme-files/website.json
+            echo "website.json copied from repo root"
+          else
+            echo "::error::website.json not found in theme-files/, config artifact, or repo root"; exit 1;
+          fi
+
+      - name: Validate environment variables
+        run: |
+          set -e
+          if [ -z "$CLOUDWAYS_HOST" ] || [ -z "$CLOUDWAYS_USER" ] || [ -z "$CLOUDWAYS_KEY" ] || [ -z "$APP_PATH" ]; then
+            echo "ERROR: Missing required environment variables"
+            echo "CLOUDWAYS_HOST: ${CLOUDWAYS_HOST:+set}"
+            echo "CLOUDWAYS_USER: ${CLOUDWAYS_USER:+set}"
+            echo "CLOUDWAYS_KEY: ${CLOUDWAYS_KEY:+set}"
+            echo "APP_PATH: ${APP_PATH:+set}"
+            exit 1
+          fi
+
+      - name: Setup SSH connection
+        run: |
+          set -e
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$CLOUDWAYS_KEY" > ~/.ssh/id_rsa_cloudways
+          chmod 600 ~/.ssh/id_rsa_cloudways
+          ssh-keyscan -H "$CLOUDWAYS_HOST" >> ~/.ssh/known_hosts
+
+      - name: Verify remote environment
+        run: |
+          set -e
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no \
+            "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+            "APP_PATH='${APP_PATH}' bash -s" <<'EOF'
+          set -euo pipefail
+          : "${APP_PATH:?APP_PATH is not set on remote}"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Remote APP_PATH does not exist: $APP_PATH" >&2
+            exit 1
+          fi
+          echo "Remote environment OK: APP_PATH is $APP_PATH"
+          EOF
+
+      - name: Create backup (optional)
+        continue-on-error: true
+        run: |
+          set -e
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no \
+            "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+            "APP_PATH='${APP_PATH}' bash -s" <<'EOF'
+          set -e
+          if [ -f "$APP_PATH/website.json" ]; then
+            cp "$APP_PATH/website.json" "$APP_PATH/website.json.backup.$(date +%Y%m%d_%H%M%S)"
+            echo "Backup created"
+          fi
+          EOF
+
+      - name: Prepare remote directories
+        run: |
+          set -e
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no \
+            "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+            "APP_PATH='${APP_PATH}' bash -s" <<'EOF'
+          set -e
+          mkdir -p "$APP_PATH/wp-content/mu-plugins"
+          mkdir -p "$APP_PATH/wp-content/mu-plugins/sitefuse"
+          mkdir -p "$APP_PATH/wp-content/themes/sitefuse-base"
+          echo "Remote directories prepared"
+          EOF
+
+      # --- Deploy mu-plugins/sitefuse from repo (loader, admin, lib, endpoints) ---
+      - name: Deploy MU plugins (sitefuse)
+        run: |
+          set -e
+          SRC_DIR="wp-content/mu-plugins/sitefuse/"
+          if [ ! -d "$SRC_DIR" ]; then
+            echo "::error::Missing $SRC_DIR in repo checkout"
+            echo "Workspace mu-plugins listing:"; ls -la wp-content/mu-plugins || true
+            exit 1
+          fi
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no" \
+            "$SRC_DIR" \
+            "$CLOUDWAYS_USER@$CLOUDWAYS_HOST:$APP_PATH/wp-content/mu-plugins/sitefuse/"
+          echo "MU plugins synced: sitefuse loader/admin/lib/endpoints"
+
+      - name: Deploy MU loader (sitefuse.php)
+        run: |
+          set -e
+          LOADER="wp-content/mu-plugins/sitefuse.php"
+          if [ -f "$LOADER" ]; then
+            rsync -avz \
+              -e "ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no" \
+              "$LOADER" \
+              "$CLOUDWAYS_USER@$CLOUDWAYS_HOST:$APP_PATH/wp-content/mu-plugins/sitefuse.php"
+            echo "MU loader deployed"
+          else
+            echo "::warning::MU loader file $LOADER not found in repo"
+          fi
+
+      - name: Deploy child theme
+        env:
+          SLUG: ${{ inputs.slug }}
+        run: |
+          set -e
+          THEME_DEST="$APP_PATH/wp-content/themes/${SLUG}-child"
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" "mkdir -p '$THEME_DEST'"
+          rsync -avz --delete -e 'ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no' \
+            "theme-files/" "$CLOUDWAYS_USER@$CLOUDWAYS_HOST:$THEME_DEST/"
+          echo "Child theme deployed to $THEME_DEST"
+
+      - name: Deploy parent theme (sitefuse-base)
+        run: |
+          set -e
+          if [ -d sitefuse-base ]; then
+            rsync -avz --delete -e 'ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no' \
+              "sitefuse-base/" "$CLOUDWAYS_USER@$CLOUDWAYS_HOST:$APP_PATH/wp-content/themes/sitefuse-base/"
+            echo "Parent theme deployed: sitefuse-base"
+          else
+            echo "::warning::sitefuse-base directory not found in repo; assuming present on server"
+          fi
+
+      - name: Publish design-spec.json to WP uploads (for Figma)
+        if: ${{ inputs.publish_spec }}
+        env:
+          SSH_USER: ${{ env.CLOUDWAYS_USER }}
+          SSH_HOST: ${{ env.CLOUDWAYS_HOST }}
+          SITE_ROOT: ${{ env.APP_PATH }}
+        run: |
+          set -e
+          if [ -f design-spec.json ]; then
+            # Create dir and write file via SSH pipe (more robust than scp)
+            ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" \
+              "mkdir -p \"$SITE_ROOT/wp-content/uploads/sitefuse\" && cat > \"$SITE_ROOT/wp-content/uploads/sitefuse/design-spec.json\"" < design-spec.json
+            # Verify
+            ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" \
+              "ls -l \"$SITE_ROOT/wp-content/uploads/sitefuse/design-spec.json\" || true"
+            echo "Design Spec (WP): https://$SITEFUSE_WP_ORIGIN/wp-content/uploads/sitefuse/design-spec.json" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "design-spec.json not found in repo root; skipping publish"
+          fi
+
+      - name: Skip legacy website.json merging (use exact AI output)
+        run: |
+          echo "Gutenberg authoritative: skipping any rewrite/merge of website.json"
+
+      - name: Deploy mu-plugins
+        run: |
+          set -e; echo "Skipping legacy mu-plugin injection (Gutenberg authoritative)"; exit 0
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no \
+            "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+            "APP_PATH='${APP_PATH}' bash -s" <<'EOF'
+          set -euo pipefail
+          MU_DIR="$APP_PATH/wp-content/mu-plugins"
+          cat > "$MU_DIR/sitefuse-home.php" <<'PHP'
+          <?php
+          /*
+           * Plugin Name: SiteFuse Enhanced Home Renderer
+           * Description: Shortcode [sitefuse_home] renders dynamic layouts from website.json
+           * Version: 2.0.0
+           */
+          add_shortcode('sitefuse_home', function () {
+              $p = ABSPATH . 'website.json';
+              $cfg = is_readable($p) ? json_decode(file_get_contents($p), true) ?: [] : [];
+
+              // Back-compat shims
+              if (!isset($cfg['hero']) && isset($cfg['heroSection'])) {
+                  $cfg['hero'] = [
+                      'title'    => get_bloginfo('name'),
+                      'subtitle' => get_bloginfo('description'),
+                      'cta'      => ['label' => 'Get Started', 'href' => '#contact'],
+                      'image'    => $cfg['heroSection']['heroImage'] ?? '',
+                      'overlay'  => 0.35,
+                  ];
+              }
+              if (!isset($cfg['pages']) && isset($cfg['customSections'])) {
+                  $blocks = [];
+                  foreach ($cfg['customSections'] as $s) {
+                      $blocks[] = ['type' => 'html', 'html' => $s['html'] ?? ''];
+                  }
+                  $cfg['pages'] = [[ 'slug'=>'home','title'=>'Home','layout'=>'landing','blocks'=>$blocks ]];
+              }
+
+              $esc = function($s) { return esc_html($s ?? ''); };
+              $img = function ($url, $alt = '') {
+                  if (!$url) return '';
+                  return '<img src="'.esc_url($url).'" alt="'.esc_attr($alt).'" class="w-full h-full object-cover" />';
+              };
+
+              // Pick home page
+              $home = ['blocks' => []];
+              if (!empty($cfg['pages']) && is_array($cfg['pages'])) {
+                  foreach ($cfg['pages'] as $page) {
+                      if (($page['slug'] ?? '') === 'home') { $home = $page; break; }
+                  }
+                  if (empty($home['blocks'])) { $home = $cfg['pages'][0]; }
+              }
+
+              ob_start();
+
+              // Enhanced block renderers
+              $render = [
+                  'hero' => function($b) use ($cfg, $esc, $img) {
+                      $hero = $cfg['hero'] ?? [];
+                      $overlay = isset($hero['overlay']) ? floatval($hero['overlay']) : 0.35;
+                      ?>
+                      <section class="hero-section relative min-h-screen flex items-center">
+                        <div class="absolute inset-0">
+                          <?php echo $img($hero['image'] ?? '', get_bloginfo('name')); ?>
+                          <div class="absolute inset-0" style="background:rgba(0,0,0,<?php echo esc_attr($overlay); ?>)"></div>
+                        </div>
+                        <div class="relative z-10 container text-center text-white py-24">
+                          <h1 class="text-6xl font-bold mb-6"><?php echo $esc($hero['title'] ?? get_bloginfo('name')); ?></h1>
+                          <p class="text-xl mb-10 opacity-90 max-w-3xl mx-auto"><?php echo $esc($hero['subtitle'] ?? get_bloginfo('description')); ?></p>
+                          <?php if (!empty($hero['cta']['label'])): ?>
+                            <a class="btn btn-primary text-lg px-8 py-4" href="<?php echo esc_url($hero['cta']['href'] ?? '#contact'); ?>">
+                              <?php echo $esc($hero['cta']['label']); ?>
+                            </a>
+                          <?php endif; ?>
+                        </div>
+                      </section>
+                      <?php
+                  },
+
+                  'features' => function($b) use ($esc) {
+                      $items = $b['items'] ?? [];
+                      $cols  = max(2, min(4, intval($b['columns'] ?? 3)));
+                      ?>
+                      <section class="py-20 bg-white">
+                        <div class="container">
+                          <?php if (!empty($b['title'])): ?>
+                            <h2 class="section-title text-center mb-16"><?php echo $esc($b['title']); ?></h2>
+                          <?php endif; ?>
+                          <div class="grid gap-8" style="grid-template-columns:repeat(<?php echo $cols; ?>,minmax(0,1fr))">
+                            <?php foreach ($items as $item): ?>
+                              <div class="text-center p-6">
+                                <?php if (!empty($item['icon'])): ?>
+                                  <div class="mb-4 text-4xl"><?php echo $esc($item['icon']); ?></div>
+                                <?php endif; ?>
+                                <h3 class="text-xl font-bold mb-4"><?php echo $esc($item['title'] ?? 'Feature'); ?></h3>
+                                <p class="text-gray-600 leading-relaxed"><?php echo $esc($item['text'] ?? ''); ?></p>
+                              </div>
+                            <?php endforeach; ?>
+                          </div>
+                        </div>
+                      </section>
+                      <?php
+                  },
+
+                  'services' => function($b) use ($esc) {
+                      $items = $b['items'] ?? [];
+                      ?>
+                      <section class="py-20 bg-gray-50">
+                        <div class="container">
+                          <?php if (!empty($b['title'])): ?>
+                            <h2 class="section-title text-center mb-16"><?php echo $esc($b['title']); ?></h2>
+                          <?php endif; ?>
+                          <div class="grid gap-8 md:grid-cols-2 lg:grid-cols-3">
+                            <?php foreach ($items as $item): ?>
+                              <div class="bg-white p-8 rounded-xl shadow-lg hover:shadow-xl transition-all duration-300">
+                                <h3 class="text-xl font-bold mb-4"><?php echo $esc($item['title'] ?? 'Service'); ?></h3>
+                                <p class="text-gray-600 mb-6"><?php echo $esc($item['text'] ?? ''); ?></p>
+                                <?php if (!empty($item['price'])): ?>
+                                  <div class="text-2xl font-bold text-primary"><?php echo $esc($item['price']); ?></div>
+                                <?php endif; ?>
+                              </div>
+                            <?php endforeach; ?>
+                          </div>
+                        </div>
+                      </section>
+                      <?php
+                  },
+
+                  'testimonial' => function($b) use ($esc) {
+                      ?>
+                      <section class="py-20 bg-primary text-white">
+                        <div class="container text-center max-w-4xl mx-auto">
+                          <blockquote class="text-3xl italic mb-8">"<?php echo $esc($b['quote'] ?? ''); ?>"</blockquote>
+                          <div class="text-lg opacity-90">— <?php echo $esc($b['author'] ?? 'Happy Client'); ?></div>
+                        </div>
+                      </section>
+                      <?php
+                  },
+
+                  'testimonials' => function($b) use ($esc) {
+                      $items = $b['items'] ?? [];
+                      ?>
+                      <section class="py-20">
+                        <div class="container">
+                          <?php if (!empty($b['title'])): ?>
+                            <h2 class="section-title text-center mb-16"><?php echo $esc($b['title']); ?></h2>
+                          <?php endif; ?>
+                          <div class="grid gap-8 md:grid-cols-2 lg:grid-cols-3">
+                            <?php foreach ($items as $item): ?>
+                              <div class="bg-white p-6 rounded-xl shadow">
+                                <div class="text-yellow-400 mb-4">★★★★★</div>
+                                <p class="mb-4 italic">"<?php echo $esc($item['quote'] ?? ''); ?>"</p>
+                                <div class="font-semibold"><?php echo $esc($item['author'] ?? 'Customer'); ?></div>
+                              </div>
+                            <?php endforeach; ?>
+                          </div>
+                        </div>
+                      </section>
+                      <?php
+                  },
+
+                  'cta' => function($b) use ($esc) {
+                      ?>
+                      <section class="py-20 bg-primary text-white text-center">
+                        <div class="container max-w-3xl mx-auto">
+                          <?php if (!empty($b['title'])): ?>
+                            <h2 class="text-4xl font-bold mb-6"><?php echo $esc($b['title']); ?></h2>
+                          <?php endif; ?>
+                          <p class="text-xl mb-8 opacity-90"><?php echo $esc($b['text'] ?? ''); ?></p>
+                          <?php $btn = $b['button'] ?? []; if (!empty($btn['label'])): ?>
+                            <a class="btn btn-secondary text-lg px-8 py-4" href="<?php echo esc_url($btn['href'] ?? '#'); ?>">
+                              <?php echo $esc($btn['label']); ?>
+                            </a>
+                          <?php endif; ?>
+                        </div>
+                      </section>
+                      <?php
+                  },
+
+                  'about' => function($b) use ($esc) {
+                      ?>
+                      <section class="py-20">
+                        <div class="container max-w-4xl mx-auto">
+                          <?php if (!empty($b['title'])): ?>
+                            <h2 class="section-title text-center mb-16"><?php echo $esc($b['title']); ?></h2>
+                          <?php endif; ?>
+                          <div class="prose prose-lg max-w-none">
+                            <?php echo wp_kses_post($b['content'] ?? $b['text'] ?? ''); ?>
+                          </div>
+                        </div>
+                      </section>
+                      <?php
+                  },
+
+                  'contact-form' => function($b) use ($esc) {
+                      ?>
+                      <section class="py-20" id="contact">
+                        <div class="container max-w-3xl mx-auto">
+                          <?php if (!empty($b['title'])): ?>
+                            <h2 class="section-title text-center mb-16"><?php echo $esc($b['title']); ?></h2>
+                          <?php endif; ?>
+                          <div class="bg-white p-8 rounded-xl shadow-lg">
+                            <p class="text-center mb-8 text-gray-600">
+                              <?php echo $esc($b['text'] ?? 'Get in touch with us today.'); ?>
+                            </p>
+                            <div class="text-center">
+                              <p class="mb-4">Replace with your favorite contact form plugin shortcode:</p>
+                              <code class="bg-gray-100 px-3 py-1 rounded">[contact-form-7 id="1"]</code>
+                            </div>
+                          </div>
+                        </div>
+                      </section>
+                      <?php
+                  },
+
+                  'pricing' => function($b) use ($esc) {
+                      $plans = $b['plans'] ?? [];
+                      ?>
+                      <section class="py-20 bg-gray-50">
+                        <div class="container">
+                          <?php if (!empty($b['title'])): ?>
+                            <h2 class="section-title text-center mb-16"><?php echo $esc($b['title']); ?></h2>
+                          <?php endif; ?>
+                          <div class="grid gap-8 md:grid-cols-2 lg:grid-cols-3 max-w-5xl mx-auto">
+                            <?php foreach ($plans as $plan): ?>
+                              <div class="bg-white p-8 rounded-xl shadow-lg text-center <?php echo ($plan['featured'] ?? false) ? 'ring-2 ring-primary' : ''; ?>">
+                                <h3 class="text-2xl font-bold mb-4"><?php echo $esc($plan['name'] ?? 'Plan'); ?></h3>
+                                <div class="text-4xl font-bold mb-6"><?php echo $esc($plan['price'] ?? '$99'); ?></div>
+                                <ul class="text-left mb-8 space-y-2">
+                                  <?php foreach ($plan['features'] ?? [] as $feature): ?>
+                                    <li class="flex items-center">
+                                      <span class="text-green-500 mr-2">✓</span>
+                                      <?php echo $esc($feature); ?>
+                                    </li>
+                                  <?php endforeach; ?>
+                                </ul>
+                                <a class="btn <?php echo ($plan['featured'] ?? false) ? 'btn-primary' : 'btn-secondary'; ?> w-full" 
+                                   href="<?php echo esc_url($plan['cta']['href'] ?? '#contact'); ?>">
+                                  <?php echo $esc($plan['cta']['label'] ?? 'Choose Plan'); ?>
+                                </a>
+                              </div>
+                            <?php endforeach; ?>
+                          </div>
+                        </div>
+                      </section>
+                      <?php
+                  },
+
+                  'team' => function($b) use ($esc, $img) {
+                      $members = $b['members'] ?? [];
+                      echo '<section class="py-20 bg-gray-50"><div class="container">';
+                      if (!empty($b['title'])) echo '<h2 class="section-title text-center mb-16">'.$esc($b['title']).'</h2>';
+                      echo '<div class="grid gap-8 md:grid-cols-2 lg:grid-cols-3">';
+                      foreach ($members as $member) {
+                          echo '<div class="bg-white p-6 rounded-xl shadow text-center">';
+                          if (!empty($member['photo'])) echo '<div class="w-24 h-24 mx-auto mb-4 rounded-full overflow-hidden">'.$img($member['photo'], $member['name'] ?? 'Team member').'</div>';
+                          echo '<h3 class="font-bold text-xl mb-2">'.$esc($member['name'] ?? 'Team Member').'</h3>';
+                          echo '<div class="text-primary font-medium mb-3">'.$esc($member['role'] ?? '').'</div>';
+                          echo '<p class="text-gray-600">'.$esc($member['bio'] ?? '').'</p></div>';
+                      }
+                      echo '</div></div></section>';
+                  },
+
+                  'gallery' => function($b) use ($img) {
+                      $images = $b['images'] ?? [];
+                      echo '<section class="py-20"><div class="container">';
+                      if (!empty($b['title'])) echo '<h2 class="section-title text-center mb-16">'.esc_html($b['title']).'</h2>';
+                      echo '<div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">';
+                      foreach ($images as $image) echo '<div class="aspect-square overflow-hidden rounded-lg">'.$img($image['url'] ?? '', $image['alt'] ?? 'Gallery image').'</div>';
+                      echo '</div></div></section>';
+                  },
+
+                  'stats' => function($b) use ($esc) {
+                      $numbers = $b['numbers'] ?? [];
+                      echo '<section class="py-20 bg-primary text-white"><div class="container"><div class="grid gap-8 md:grid-cols-2 lg:grid-cols-4 text-center">';
+                      foreach ($numbers as $stat) {
+                          echo '<div><div class="text-5xl font-bold mb-2">'.$esc($stat['number'] ?? '100+').'</div>';
+                          echo '<div class="text-lg opacity-90">'.$esc($stat['label'] ?? 'Statistic').'</div></div>';
+                      }
+                      echo '</div></div></section>';
+                  },
+
+                  'faq' => function($b) use ($esc) {
+                      $questions = $b['questions'] ?? [];
+                      echo '<section class="py-20"><div class="container max-w-4xl mx-auto">';
+                      if (!empty($b['title'])) echo '<h2 class="section-title text-center mb-16">'.$esc($b['title']).'</h2>';
+                      echo '<div class="space-y-6">';
+                      foreach ($questions as $qa) {
+                          echo '<div class="bg-white p-6 rounded-xl shadow">';
+                          echo '<h3 class="font-bold text-lg mb-3">'.$esc($qa['question'] ?? 'Question?').'</h3>';
+                          echo '<p class="text-gray-600">'.$esc($qa['answer'] ?? 'Answer.').'</p></div>';
+                      }
+                      echo '</div></div></section>';
+                  },
+
+                  'classes' => function($b) use ($esc) {
+                      $schedule = $b['schedule'] ?? [];
+                      echo '<section class="py-20 bg-gray-50"><div class="container">';
+                      if (!empty($b['title'])) echo '<h2 class="section-title text-center mb-16">'.$esc($b['title']).'</h2>';
+                      echo '<div class="grid gap-6 md:grid-cols-2 lg:grid-cols-3">';
+                      foreach ($schedule as $class) {
+                          echo '<div class="bg-white p-6 rounded-xl shadow">';
+                          echo '<h3 class="font-bold text-xl mb-3">'.$esc($class['name'] ?? 'Class').'</h3>';
+                          echo '<div class="space-y-2 text-gray-600">';
+                          if (!empty($class['time'])) echo '<div><strong>Time:</strong> '.$esc($class['time']).'</div>';
+                          if (!empty($class['instructor'])) echo '<div><strong>Instructor:</strong> '.$esc($class['instructor']).'</div>';
+                          echo '</div>';
+                          if (!empty($class['description'])) echo '<p class="mt-4 text-gray-600">'.$esc($class['description']).'</p>';
+                          echo '</div>';
+                      }
+                      echo '</div></div></section>';
+                  },
+
+                  'menu' => function($b) use ($esc) {
+                      $categories = $b['categories'] ?? [];
+                      echo '<section class="py-20"><div class="container">';
+                      if (!empty($b['title'])) echo '<h2 class="section-title text-center mb-16">'.$esc($b['title']).'</h2>';
+                      echo '<div class="grid gap-12 lg:grid-cols-2">';
+                      foreach ($categories as $category) {
+                          echo '<div><h3 class="text-2xl font-bold mb-6 text-primary">'.$esc($category['name'] ?? 'Menu Category').'</h3>';
+                          echo '<div class="space-y-4">';
+                          foreach ($category['items'] ?? [] as $item) {
+                              echo '<div class="flex justify-between items-start border-b border-gray-200 pb-3">';
+                              echo '<div class="flex-1"><h4 class="font-semibold">'.$esc($item['name'] ?? 'Menu Item').'</h4>';
+                              if (!empty($item['description'])) echo '<p class="text-gray-600 text-sm mt-1">'.$esc($item['description']).'</p>';
+                              echo '</div><div class="font-bold text-primary ml-4">'.$esc($item['price'] ?? '$10').'</div></div>';
+                          }
+                          echo '</div></div>';
+                      }
+                      echo '</div></div></section>';
+                  },
+
+                  'hours' => function($b) use ($esc) {
+                      $hours = $b['hours'] ?? [];
+                      echo '<section class="py-20 bg-white"><div class="container max-w-2xl mx-auto">';
+                      if (!empty($b['title'])) echo '<h2 class="section-title text-center mb-16">'.$esc($b['title']).'</h2>';
+                      echo '<div class="bg-gray-50 p-8 rounded-xl">';
+                      foreach ($hours as $day => $times) {
+                          echo '<div class="flex justify-between items-center py-3 border-b border-gray-200 last:border-b-0">';
+                          echo '<div class="font-semibold">'.$esc(ucfirst($day)).'</div>';
+                          echo '<div class="text-gray-600">'.$esc($times).'</div></div>';
+                      }
+                      echo '</div></div></section>';
+                  },
+
+                  'two-col' => function($b) {
+                      echo '<section class="py-20"><div class="container">';
+                      if (!empty($b['title'])) echo '<h2 class="section-title text-center mb-16">'.esc_html($b['title']).'</h2>';
+                      echo '<div class="grid gap-12 lg:grid-cols-2 items-center">';
+                      echo '<div class="prose prose-lg max-w-none">'.wp_kses_post($b['left'] ?? $b['content'] ?? '').'</div>';
+                      echo '<div class="prose prose-lg max-w-none">'.wp_kses_post($b['right'] ?? $b['image'] ?? '').'</div>';
+                      echo '</div></div></section>';
+                  },
+
+                  'three-col' => function($b) {
+                      echo '<section class="py-20 bg-gray-50"><div class="container">';
+                      if (!empty($b['title'])) echo '<h2 class="section-title text-center mb-16">'.esc_html($b['title']).'</h2>';
+                      echo '<div class="grid gap-8 lg:grid-cols-3">';
+                      echo '<div class="prose max-w-none">'.wp_kses_post($b['left'] ?? '').'</div>';
+                      echo '<div class="prose max-w-none">'.wp_kses_post($b['center'] ?? '').'</div>';
+                      echo '<div class="prose max-w-none">'.wp_kses_post($b['right'] ?? '').'</div>';
+                      echo '</div></div></section>';
+                  },
+
+                  'newsletter' => function($b) use ($esc) {
+                      ?>
+                      <section class="py-20 bg-primary text-white">
+                        <div class="container max-w-2xl mx-auto text-center">
+                          <?php if (!empty($b['title'])): ?>
+                            <h2 class="text-3xl font-bold mb-4"><?php echo $esc($b['title']); ?></h2>
+                          <?php endif; ?>
+                          <p class="text-lg mb-8 opacity-90"><?php echo $esc($b['text'] ?? 'Stay updated with our latest news.'); ?></p>
+                          <div class="flex flex-col sm:flex-row gap-4 max-w-md mx-auto">
+                            <input type="email" placeholder="Enter your email" 
+                                   class="flex-1 px-4 py-3 rounded-lg text-gray-800" />
+                            <button class="btn btn-secondary whitespace-nowrap">
+                              <?php echo $esc($b['button_text'] ?? 'Subscribe'); ?>
+                            </button>
+                          </div>
+                        </div>
+                      </section>
+                      <?php
+                  },
+
+                  'benefits' => function($b) use ($esc) {
+                      $items = $b['items'] ?? [];
+                      echo '<section class="py-20"><div class="container">';
+                      if (!empty($b['title'])) echo '<h2 class="section-title text-center mb-16">'.$esc($b['title']).'</h2>';
+                      echo '<div class="grid gap-8 md:grid-cols-2 lg:grid-cols-3">';
+                      foreach ($items as $benefit) {
+                          echo '<div class="flex items-start space-x-4">';
+                          echo '<div class="flex-shrink-0 w-8 h-8 bg-green-100 text-green-600 rounded-full flex items-center justify-center">✓</div>';
+                          echo '<div><h3 class="font-bold mb-2">'.$esc($benefit['title'] ?? 'Benefit').'</h3>';
+                          echo '<p class="text-gray-600">'.$esc($benefit['description'] ?? '').'</p></div></div>';
+                      }
+                      echo '</div></div></section>';
+                  },
+
+                  'service-cards' => function($b) use ($esc) {
+                      $items = $b['items'] ?? [];
+                      echo '<section class="py-20 bg-gray-50"><div class="container">';
+                      if (!empty($b['title'])) echo '<h2 class="section-title text-center mb-16">'.$esc($b['title']).'</h2>';
+                      echo '<div class="grid gap-8 md:grid-cols-2 lg:grid-cols-3">';
+                      foreach ($items as $item) {
+                          echo '<div class="bg-white p-8 rounded-xl shadow-lg hover:shadow-xl transition-all duration-300">';
+                          echo '<h3 class="text-xl font-bold mb-4">'.$esc($item['title'] ?? 'Service').'</h3>';
+                          echo '<p class="text-gray-600 mb-6">'.$esc($item['text'] ?? '').'</p>';
+                          if (!empty($item['price'])) echo '<div class="text-2xl font-bold text-primary">'.$esc($item['price']).'</div>';
+                          echo '</div>';
+                      }
+                      echo '</div></div></section>';
+                  },
+
+                  'html' => function($b) { 
+                      echo wp_kses_post($b['html'] ?? $b['content'] ?? ''); 
+                  },
+              ];
+
+              // Render all blocks from the home page
+              foreach ($home['blocks'] ?? [] as $block) {
+                  $type = $block['type'] ?? 'html';
+                  if (isset($render[$type]) && is_callable($render[$type])) {
+                      $render[$type]($block);
+                  } else {
+                      echo '<section class="py-20"><div class="container"><p class="text-center text-gray-500">Unknown block type: ' . esc_html($type) . '</p></div></section>';
+                  }
+              }
+
+              return ob_get_clean();
+          });
+          PHP
+          echo "mu-plugin deployed successfully"
+          EOF
+
+      - name: Deploy REST endpoints for Figma (design-spec + public-website)
+        run: |
+          set -e
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no \
+            "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+            "APP_PATH='${APP_PATH}' bash -s" <<'EOF'
+          set -euo pipefail
+          MU_DIR="$APP_PATH/wp-content/mu-plugins"
+          mkdir -p "$MU_DIR"
+          cat > "$MU_DIR/sitefuse-endpoints.php" <<'PHP'
+          <?php
+          if (!defined('ABSPATH')) exit;
+          add_action('rest_api_init', function () {
+            // GET design-spec from uploads (public, with CORS)
+            register_rest_route('sitefuse/v1', '/design-spec', [
+              'methods'  => 'GET',
+              'permission_callback' => '__return_true',
+              'callback' => function () {
+                $upload_dir = wp_upload_dir();
+                $file = trailingslashit($upload_dir['basedir']) . 'sitefuse/design-spec.json';
+                if (!is_readable($file)) return new \WP_Error('not_found', 'design-spec.json not found', ['status' => 404]);
+                $json = file_get_contents($file);
+                $data = json_decode($json, true);
+                if (json_last_error() !== JSON_ERROR_NONE) return new \WP_Error('bad_json', 'Invalid JSON', ['status' => 500]);
+                @header('Access-Control-Allow-Origin: *');
+                @header('Access-Control-Allow-Methods: GET, OPTIONS');
+                @header('Access-Control-Allow-Headers: Content-Type');
+                @header('Content-Type: application/json; charset=utf-8');
+                return rest_ensure_response($data);
+              }
+            ]);
+            
+            // GET website.json from site root (public, with CORS)
+            register_rest_route('sitefuse/v1', '/public-website', [
+              'methods'  => 'GET',
+              'permission_callback' => '__return_true',
+              'callback' => function () {
+                $file = ABSPATH . 'website.json';
+                $data = is_readable($file) ? json_decode(file_get_contents($file), true) ?: [] : [];
+                @header('Access-Control-Allow-Origin: *');
+                @header('Access-Control-Allow-Methods: GET, OPTIONS');
+                @header('Access-Control-Allow-Headers: Content-Type');
+                @header('Content-Type: application/json; charset=utf-8');
+                return rest_ensure_response($data);
+              }
+            ]);
+
+            register_rest_route('sitefuse/v1', '/design-spec', [
+              'methods'  => 'POST',
+              'permission_callback' => function () {
+                $hdr = isset($_SERVER['HTTP_X_SF_TOKEN']) ? $_SERVER['HTTP_X_SF_TOKEN'] : '';
+                $expected = getenv('SITEFUSE_TOKEN');
+                return $expected && hash_equals($expected, $hdr);
+              },
+              'callback' => function (\WP_REST_Request $req) {
+                $json = $req->get_body();
+                if (!$json) return new \WP_Error('bad_request', 'Empty body', ['status' => 400]);
+                json_decode($json);
+                if (json_last_error() !== JSON_ERROR_NONE) return new \WP_Error('bad_json', 'Invalid JSON body', ['status' => 400]);
+                $upload_dir = wp_upload_dir();
+                $dir = trailingslashit($upload_dir['basedir']) . 'sitefuse';
+                if (!is_dir($dir)) wp_mkdir_p($dir);
+                file_put_contents($dir . '/design-spec.json', $json);
+                return ['ok' => true];
+              }
+            ]);
+          });
+          PHP
+          EOF
+
+      - name: Warm REST routes cache and verify endpoints
+        continue-on-error: true
+        run: |
+          set -e
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no \
+            "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+            "APP_PATH='${APP_PATH}' bash -s" <<'EOF'
+          set -e
+          # Hit the REST index and our routes to warm caches and verify availability
+          curl -fsS "https://$HOSTNAME/wp-json" >/dev/null || true
+          curl -fsS "https://$HOSTNAME/wp-json/sitefuse/v1/design-spec" | head -c 120 || true
+          echo
+          curl -fsS "https://$HOSTNAME/wp-json/sitefuse/v1/public-website" | head -c 120 || true
+          echo
+          EOF
+
+      - name: Deploy blocks-config.json
+        run: |
+          set -euo pipefail
+          
+          echo "Looking for blocks-config.json..."
+          
+          # Find blocks-config.json in various possible locations
+          SRC=""
+          SEARCH_PATHS=(
+            "blocks-config.json"
+            "wp-content/mu-plugins/sitefuse/blocks-config.json"
+            "theme-files/blocks-config.json"
+          )
+          
+          for path in "${SEARCH_PATHS[@]}"; do
+            if [ -f "$path" ]; then
+              SRC="$path"
+              echo "Found blocks-config.json at: $path"
+              break
+            fi
+          done
+          
+          if [ -z "$SRC" ]; then
+            echo "::error::blocks-config.json not found in any expected location"
+            echo "Searched in: ${SEARCH_PATHS[*]}"
+            exit 1
+          fi
+          
+          # Upload the file using rsync (more reliable than scp)
+          echo "Uploading blocks-config.json..."
+          rsync -avz \
+            -e "ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no" \
+            "$SRC" \
+            "$CLOUDWAYS_USER@$CLOUDWAYS_HOST:$APP_PATH/wp-content/mu-plugins/sitefuse/blocks-config.json"
+          
+          # Verify the upload
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no \
+            "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+            "if [ -f '$APP_PATH/wp-content/mu-plugins/sitefuse/blocks-config.json' ]; then
+              echo '✅ blocks-config.json uploaded successfully'
+              ls -la '$APP_PATH/wp-content/mu-plugins/sitefuse/blocks-config.json'
+            else
+              echo '::error::blocks-config.json upload verification failed'
+              exit 1
+            fi"
+
+      - name: Ensure required blocks in allow-list on server
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+            "APP_PATH='${APP_PATH}' bash -s" <<'EOS'
+          set -euo pipefail
+          CFG="$APP_PATH/wp-content/mu-plugins/sitefuse/blocks-config.json"
+          cp "$CFG" "$CFG.bak.$(date +%F-%H%M%S)"
+          jq '
+          (.blocks //= []) |
+          .blocks += [
+          {"type":"hero","label":"Hero","category":"hero","supports_images":true,"industries":["all"]},
+          {"type":"features","label":"Features","category":"content","supports_images":false,"industries":["all"]},
+          {"type":"services","label":"Services","category":"content","supports_images":false,"industries":["all"]},
+          {"type":"testimonial","label":"Testimonial","category":"social-proof","supports_images":false,"industries":["all"]},
+          {"type":"benefits","label":"Benefits","category":"content","supports_images":false,"industries":["all"]},
+          {"type":"faq","label":"FAQ","category":"content","supports_images":false,"industries":["all"]},
+          {"type":"gallery","label":"Gallery","category":"media","supports_images":true,"industries":["all"]},
+          {"type":"cta","label":"CTA","category":"cta","supports_images":false,"industries":["all"]},
+          {"type":"footer","label":"Footer","category":"layout","supports_images":false,"industries":["all"]}
+          ] | .blocks |= unique_by(.type)
+          ' "$CFG" > "$CFG.new" && mv "$CFG.new" "$CFG"
+          EOS
+
+      - name: Verify deployment files
+        run: |
+          set -e
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no \
+            "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+            "APP_PATH='${APP_PATH}' SLUG='${{ inputs.slug }}' bash -s" <<'EOF'
+          set -e
+          echo "Verifying deployment files..."
+          
+          # Check theme directory
+          THEME_DIR="$APP_PATH/wp-content/themes/${SLUG}-child"
+          if [ -d "$THEME_DIR" ]; then
+            echo "✅ Theme directory exists: $THEME_DIR"
+            ls -la "$THEME_DIR" | head -10
+          else
+            echo "❌ Theme directory missing!: $THEME_DIR"
+          fi
+          
+          # Check website.json
+          if [ -f "$APP_PATH/website.json" ]; then
+            echo "✅ website.json exists"
+            jq -r '.name // "Unknown"' "$APP_PATH/website.json"
+          else
+            echo "❌ website.json missing"
+          fi
+          
+          # Check mu-plugin
+          if [ -f "$APP_PATH/wp-content/mu-plugins/sitefuse-home.php" ]; then
+            echo "✅ mu-plugin exists"
+          else
+            echo "❌ mu-plugin missing"
+          fi
+          EOF
+
+      - name: Configure WordPress
+        env:
+          SLUG: ${{ inputs.slug }}
+          NAME: ${{ inputs.name }}
+          TAGLINE: ${{ inputs.tagline }}
+        run: |
+          set -e
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+            "APP_PATH='${APP_PATH}' SLUG='${SLUG}' NAME='${NAME}' TAGLINE='${TAGLINE}' bash -s" <<'EOS'
+          set -euo pipefail
+          cd "$APP_PATH"
+
+          wp option update blogname "$NAME" --allow-root
+          wp option update blogdescription "$TAGLINE" --allow-root
+          wp theme activate "${SLUG}-child" --allow-root
+
+          HOME_ID=$(wp post list --post_type=page --name=home --field=ID --allow-root | head -1)
+          if [ -z "$HOME_ID" ]; then
+            HOME_ID=$(wp post create --post_type=page --post_title="Home" --post_name="home" --post_status=publish --porcelain --allow-root)
+          fi
+          # Do not overwrite content with legacy shortcode. Gutenberg is authoritative.
+          wp option update show_on_front page --allow-root
+          wp option update page_on_front "$HOME_ID" --allow-root
+
+          wp menu delete "Primary Menu" --allow-root 2>/dev/null || true
+          wp menu create "Primary Menu" --allow-root
+          for slug in home about services contact; do
+            ID=$(wp post list --post_type=page --name="$slug" --field=ID --allow-root | head -1)
+            if [ -z "$ID" ] && [ "$slug" != "home" ]; then
+              TITLE=$(echo "$slug" | sed 's/^./\U&/')
+              ID=$(wp post create --post_type=page --post_title="$TITLE" --post_name="$slug" --post_status=publish --porcelain --allow-root)
+            fi
+            if [ -n "$ID" ]; then
+              MENU_TITLE=$(echo "$slug" | sed 's/^./\U&/')
+              wp menu item add-post "Primary Menu" "$ID" --title="$MENU_TITLE" --allow-root
+            fi
+          done
+          wp menu location assign "Primary Menu" primary --allow-root
+          wp rewrite flush --allow-root
+          EOS
+
+      - name: Test site health
+        continue-on-error: true
+        run: |
+          set -e
+          ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no \
+            "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+            "APP_PATH='${APP_PATH}' bash -s" <<'EOF'
+          set -e
+          cd "$APP_PATH"
+          echo "Testing WordPress installation..."
+          wp core verify-checksums --allow-root || echo "Core verification skipped"
+          wp theme list --allow-root | head -5
+          wp plugin list --allow-root | head -5
+          echo "Site health check completed"
+          EOF
+
+      - name: Report deployment
+        env:
+          NAME: ${{ inputs.name }}
+          SLUG: ${{ inputs.slug }}
+        run: |
+          echo "✅ Deployment completed!"
+          echo "🏢 Site Name: ${NAME}"
+          echo "🔧 Theme: ${SLUG}-child"
+          echo "🌐 Visit via your Cloudways domain for this app"
+
+      - name: Verify publisher route is available
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SITE_URL:-}" ]; then echo "::error::SITE_URL not set"; exit 1; fi
+          curl -fsS "${SITE_URL%/}/wp-json" | jq -e '.routes | has("/sitefuse/v1/publish")' >/dev/null
+          echo "Publisher route present"
+
+      - name: Gutenberg guard – Publish website.json and purge cache
+        if: ${{ always() }}
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+          PUBLISH_TOKEN: ${{ secrets.SITEFUSE_TOKEN_PUBLISH }}
+          CLOUDWAYS_HOST: ${{ secrets.CLOUDWAYS_HOST }}
+          CLOUDWAYS_USER: ${{ secrets.CLOUDWAYS_USER }}
+          APP_PATH: ${{ secrets.APP_PATH }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SITE_URL:-}" ] || [ -z "${PUBLISH_TOKEN:-}" ]; then
+            echo "::error::Missing SITE_URL or SITEFUSE_TOKEN_PUBLISH"; exit 1;
+          fi
+          URL="${SITE_URL%/}/wp-json/sitefuse/v1/publish"
+          echo "Publishing to $URL"
+          # Resolve website.json source for publish
+          if [ -f theme-files/website.json ]; then PUBLISH_SRC="theme-files/website.json";
+          elif [ -f config-artifact/website.json ]; then PUBLISH_SRC="config-artifact/website.json";
+          elif [ -f website.json ]; then PUBLISH_SRC="website.json"; else echo "::error::website.json not found for publish"; exit 1; fi
+          code=$(curl -s -o out.json -w "%{http_code}" -X POST "$URL" \
+            -H "Content-Type: application/json" \
+            -H "X-SF-Token: ${PUBLISH_TOKEN}" \
+            --data-binary @"${PUBLISH_SRC}" || true)
+          echo "HTTP $code" && cat out.json || true
+          if [ "$code" != "200" ]; then echo "::error::Publisher returned $code"; exit 1; fi
+
+          # Best-effort Breeze purge via WP-CLI (keep simple to avoid YAML/heredoc quoting pitfalls)
+          if [ -n "${CLOUDWAYS_HOST:-}" ] && [ -n "${CLOUDWAYS_USER:-}" ] && [ -n "${APP_PATH:-}" ]; then
+            ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no \
+              "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+              "set -e; APP_PATH='${APP_PATH}'; if wp --path=\"$APP_PATH\" plugin is-active breeze --allow-root >/dev/null 2>&1; then wp --path=\"$APP_PATH\" breeze purge --allow-root --cache=all || true; else echo 'Breeze not active; skipping CLI purge'; fi"
+          fi
+
+      - name: Acceptance – Home has Gutenberg markers
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+          CLOUDWAYS_HOST: ${{ secrets.CLOUDWAYS_HOST }}
+          CLOUDWAYS_USER: ${{ secrets.CLOUDWAYS_USER }}
+          APP_PATH: ${{ secrets.APP_PATH }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SITE_URL:-}" ]; then echo "::error::SITE_URL not set"; exit 1; fi
+          # First try front-end HTML (may be minified by cache)
+          HTML=$(curl -fsS "${SITE_URL%/}/?sf_nocache=1" || true)
+          if printf "%s" "$HTML" | grep -q "<!-- wp:"; then
+            echo "Gutenberg markers found in front-end HTML"; exit 0;
+          fi
+          echo "Front-end markers not found; checking WP-CLI post_content..."
+          if [ -n "${CLOUDWAYS_HOST:-}" ] && [ -n "${CLOUDWAYS_USER:-}" ] && [ -n "${APP_PATH:-}" ]; then
+            ssh -i ~/.ssh/id_rsa_cloudways -o StrictHostKeyChecking=no \
+              "$CLOUDWAYS_USER@$CLOUDWAYS_HOST" \
+              "set -euo pipefail; \
+               ID=\$(wp --path='${APP_PATH}' post list --post_type=page --name=home --field=ID --allow-root | head -1 || true); \
+               if [ -z \"\$ID\" ]; then ID=\$(wp --path='${APP_PATH}' option get page_on_front --allow-root || true); fi; \
+               CONTENT=\$(wp --path='${APP_PATH}' post get \"\$ID\" --field=post_content --allow-root 2>/dev/null || true); \
+               if echo \"\$CONTENT\" | grep -q '<!-- wp:'; then echo 'Gutenberg markers present in post_content'; else echo '::error::No Gutenberg markers found in post_content'; exit 1; fi"
+          else
+            echo "::error::Cannot SSH to check post_content; missing CLOUDWAYS_* env"; exit 1;
+          fi
+
+      - name: Produce deploy run summary
+        if: ${{ always() }}
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          set -e
+          mkdir -p run-summary
+          SRC=""
+          if [ -f theme-files/website.json ]; then SRC="theme-files/website.json";
+          elif [ -f config-artifact/website.json ]; then SRC="config-artifact/website.json";
+          elif [ -f website.json ]; then SRC="website.json"; fi
+          STATUS="unknown"; [ -f out.json ] && STATUS="ok"
+          HTTP=$(cat out.json 2>/dev/null | jq -r '.ok? // empty' || true)
+          jq -n --arg site "${SITE_URL:-}" --arg src "$SRC" \
+            --arg status "$STATUS" '{deploy: {site_url:$site, website_src:$src, status:$status}}' \
+            > run-summary/deploy.json
+
+      - name: Upload run summary (Deploy)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-summary-deploy-${{ github.run_id }}
+          path: run-summary/deploy.json
+          retention-days: 3

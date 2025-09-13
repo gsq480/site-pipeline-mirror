@@ -1,0 +1,134 @@
+name: sitefuse-v2
+on:
+  workflow_dispatch:
+    inputs:
+      prompt_file:
+        description: Path to prompt YAML
+        required: false
+        default: sitefuse.prompt.yaml
+      allow_placeholders:
+        description: Allow image placeholders if Google fails (true/false)
+        required: false
+        default: 'false'
+      smoke_strict:
+        description: Fail run if smoke test sees no <img> (true/false)
+        required: false
+        default: 'true'
+      prompt_text:
+        description: Freeform prompt text (optional)
+        required: false
+        default: ''
+      project_slug:
+        description: Optional project slug (lowercase, kebab-case)
+        required: false
+        default: ''
+      project_name:
+        description: Optional project name
+        required: false
+        default: ''
+      ssh_preflight:
+        description: Run SSH preflight step (true/false)
+        required: false
+        default: 'true'
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build prompt file from freeform (optional)
+        if: ${{ github.event.inputs.prompt_text != '' }}
+        run: |
+          slug="${{ github.event.inputs.project_slug }}"
+          name="${{ github.event.inputs.project_name }}"
+          if [ -z "$slug" ]; then slug="sf-$(date +%Y%m%d-%H%M%S)"; fi
+          if [ -z "$name" ]; then name="SiteFuse Project"; fi
+          cat > sitefuse.prompt.yaml <<YAML
+          project:
+            slug: ${slug}
+            name: ${name}
+          wordpress:
+            url: ${SITE_URL}
+          style:
+            tone: professional, clear
+          figma:
+            page: Marketing
+            components: ["block/hero", "block/features", "block/testimonials", "block/cta"]
+          images:
+            style: "Modern, clean, brand-aligned"
+          nav:
+            - slug: home
+              title: Home
+            - slug: services
+              title: Services
+            - slug: contact
+              title: Contact
+          notes: |
+            ${{ github.event.inputs.prompt_text }}
+          YAML
+          echo "Wrote sitefuse.prompt.yaml"
+      - name: SSH preflight
+        if: ${{ github.event.inputs.ssh_preflight != 'false' }}
+        env:
+          CLOUDWAYS_KEY: ${{ secrets.CLOUDWAYS_KEY }}
+          CLOUDWAYS_SSH_KEY: ${{ secrets.CLOUDWAYS_SSH_KEY }}
+          CLOUDWAYS_USER: ${{ secrets.CLOUDWAYS_USER }}
+          CLOUDWAYS_HOST: ${{ secrets.CLOUDWAYS_HOST }}
+          CLOUDWAYS_PORT: ${{ secrets.CLOUDWAYS_PORT }}
+        run: |
+          if [ -z "${CLOUDWAYS_USER}" ] || [ -z "${CLOUDWAYS_HOST}" ] || { [ -z "${CLOUDWAYS_SSH_KEY}" ] && [ -z "${CLOUDWAYS_KEY}" ]; }; then
+            echo "Skipping SSH preflight: missing CLOUDWAYS_* secrets";
+            exit 0;
+          fi
+          echo "Preflight SSH to ${CLOUDWAYS_USER}@${CLOUDWAYS_HOST}"
+          keyfile=$(mktemp)
+          raw="${CLOUDWAYS_SSH_KEY:-$CLOUDWAYS_KEY}"
+          printf "%s" "$raw" > "$keyfile.tmp"
+          # Normalize CRLF and escaped \n
+          sed -i 's/\r//g; s/\\n/\n/g' "$keyfile.tmp"
+          # Detect base64 and decode if needed
+          if ! grep -q "BEGIN [A-Z ]*PRIVATE KEY" "$keyfile.tmp"; then
+            if echo "$raw" | tr -d '\n\r' | grep -Eq '^[A-Za-z0-9+/=]+$'; then
+              echo "$raw" | tr -d '\n\r' | base64 -d > "$keyfile.tmp" 2>/dev/null || true
+            fi
+          fi
+          mv "$keyfile.tmp" "$keyfile"
+          chmod 600 "$keyfile"
+          port_opt=""; if [ -n "$CLOUDWAYS_PORT" ]; then port_opt="-p $CLOUDWAYS_PORT"; fi
+          ssh -i "$keyfile" -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -o BatchMode=yes $port_opt "${CLOUDWAYS_USER}@${CLOUDWAYS_HOST}" "echo OK && uname -a"
+          rm -f "$keyfile"
+      - run: npm ci || npm i
+      - name: Run orchestrator
+        run: |
+          PROMPT_PATH="${{ github.event.inputs.prompt_file }}"
+          if [ "${{ github.event.inputs.prompt_text }}" != "" ]; then PROMPT_PATH="sitefuse.prompt.yaml"; fi
+          node scripts/sitefuse.mjs --prompt "$PROMPT_PATH"
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          SITEFUSE_ALLOW_PLACEHOLDERS: ${{ github.event.inputs.allow_placeholders }}
+          SITEFUSE_IMAGE_PROVIDER: gaia
+          SITEFUSE_SMOKE_STRICT: ${{ github.event.inputs.smoke_strict }}
+          SITEFUSE_INGEST_MODE: rest
+          FIGMA_TOKEN: ${{ secrets.FIGMA_TOKEN }}
+          FIGMA_FILE_KEY: ${{ secrets.FIGMA_FILE_KEY }}
+          CLOUDWAYS_HOST: ${{ secrets.CLOUDWAYS_HOST }}
+          CLOUDWAYS_USER: ${{ secrets.CLOUDWAYS_USER }}
+          CLOUDWAYS_KEY:  ${{ secrets.CLOUDWAYS_KEY }}
+          CLOUDWAYS_SSH_KEY: ${{ secrets.CLOUDWAYS_SSH_KEY }}
+          CLOUDWAYS_PORT: ${{ secrets.CLOUDWAYS_PORT }}
+          APP_PATH: ${{ secrets.APP_PATH }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          SITE_URL: ${{ secrets.SITE_URL }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          SITEFUSE_TOKEN_PUBLISH: ${{ secrets.SITEFUSE_TOKEN_PUBLISH }}
+      - name: Commit build artefacts
+        run: |
+          git config user.name "sitefuse-bot"
+          git config user.email "bot@example.com"
+          git add build/ || true
+          git commit -m "chore: add build artefacts" || echo "nothing to commit"
+          git push || true
