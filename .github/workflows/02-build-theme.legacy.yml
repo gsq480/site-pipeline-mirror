@@ -1,0 +1,682 @@
+# .github/workflows/02-build-theme.yml
+name: Build Theme
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_artifact:
+        description: 'Configuration artifact name'
+        required: true
+        type: string
+      strict_mode:
+        description: "Fail build if unknown blocks are found"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false","true"]
+      generate_logo:
+        description: 'Generate AI logo (Vertex Imagen)'
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      config_artifact:
+        required: true
+        type: string
+      strict_mode:
+        required: false
+        type: string
+        default: "false"
+      generate_logo:
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      theme_artifact:
+        description: "Built theme artifact"
+        value: theme-${{ jobs.build.outputs.slug }}-${{ github.run_id }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      slug: ${{ steps.config.outputs.slug }}
+      artifact_id: ${{ steps.upload.outputs['artifact-id'] }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      # --- Fetch configuration artifact from 01 ---
+      - name: Download configuration
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.config_artifact }}
+
+      # --- Schema validation and filtering ---
+      - name: Validate website.json against blocks-config.json
+        run: |
+          STRICT_FLAG=""
+          if [ "${{ inputs.strict_mode }}" = "true" ] || [ "${{ github.event.inputs.strict_mode }}" = "true" ]; then STRICT_FLAG="--strict"; fi
+          node tools/validate-website.mjs --in website.json --config blocks-config.json --out website.json $STRICT_FLAG
+
+      - name: Summarize validation
+        if: always()
+        run: |
+          echo "## Website.json validation" >> $GITHUB_STEP_SUMMARY
+          if [ -f validate-report.txt ]; then
+            cat validate-report.txt >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No report produced by validator." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Extract configuration values
+        id: config
+        run: |
+          echo "slug=$(jq -r '.slug // "business-site"' website.json)"        >> $GITHUB_OUTPUT
+          echo "name=$(jq -r '.name // "Your Business"' website.json)"        >> $GITHUB_OUTPUT
+          echo "tagline=$(jq -r '.tagline // "Professional services"' website.json)" >> $GITHUB_OUTPUT
+          echo "brand=$(jq -r '.brand.colors.primary // "#2563eb"' website.json)"   >> $GITHUB_OUTPUT
+          echo "accent=$(jq -r '.brand.colors.accent  // "#1d4ed8"' website.json)"   >> $GITHUB_OUTPUT
+
+      - name: Generate theme files
+        env:
+          SLUG:    ${{ steps.config.outputs.slug }}
+          NAME:    ${{ steps.config.outputs.name }}
+          TAGLINE: ${{ steps.config.outputs.tagline }}
+          BRAND:   ${{ steps.config.outputs.brand }}
+          ACCENT:  ${{ steps.config.outputs.accent }}
+        run: |
+          set -e
+          THEME_DIR="${SLUG}-child"
+          mkdir -p "$THEME_DIR/assets/css" "$THEME_DIR/assets/js" "$THEME_DIR/assets/img" "$THEME_DIR/dist" "$THEME_DIR/patterns"
+
+          # Generate a simple SVG logo from site initials and brand colors
+          INIT=$(printf "%s" "$NAME" | awk '{up=""; for(i=1;i<=NF && i<=2;i++){c=substr($i,1,1); up=up toupper(c)}; print up}')
+          [ -z "$INIT" ] && INIT="SF"
+          cat > "$THEME_DIR/assets/img/logo.svg" << EOF
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="$NAME logo">
+            <defs>
+              <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="$BRAND"/>
+                <stop offset="100%" stop-color="$ACCENT"/>
+              </linearGradient>
+            </defs>
+            <rect x="8" y="8" width="112" height="112" rx="24" fill="url(#g)"/>
+            <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-weight="700" font-size="56" fill="#ffffff">$INIT</text>
+          </svg>
+          EOF
+
+      - name: Authenticate to Google Cloud (for logo)
+        if: ${{ inputs.generate_logo == true || github.event.inputs.generate_logo == 'true' }}
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Setup Google Cloud SDK (for logo)
+        if: ${{ inputs.generate_logo == true || github.event.inputs.generate_logo == 'true' }}
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Generate AI Logo (Vertex Imagen)
+        if: ${{ inputs.generate_logo == true || github.event.inputs.generate_logo == 'true' }}
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          SLUG: ${{ steps.config.outputs.slug }}
+        run: |
+          set -euo pipefail
+          LOCATION="us-central1"
+          MODEL="projects/${GCP_PROJECT_ID}/locations/${LOCATION}/publishers/google/models/imagen-3.0-generate-002"
+          ACCESS_TOKEN="$(gcloud auth print-access-token)"
+          THEME_DIR="${SLUG}-child"
+          NAME="${{ steps.config.outputs.name }}"
+          TAGLINE="${{ steps.config.outputs.tagline }}"
+          BRAND="${{ steps.config.outputs.brand }}"
+          ACCENT="${{ steps.config.outputs.accent }}"
+
+          PROMPT="Minimal modern logo mark for '${NAME}', ${TAGLINE}. Flat vector style, simple geometric shape, brand colors ${BRAND} and ${ACCENT}. No text, no letters, no watermark, clean transparent look, SVG-like aesthetics."
+          PROMPT_ESCAPED=${PROMPT//\"/\\\"}
+
+          echo "Generating logo with Vertex Imagen…"
+          curl -sS \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://${LOCATION}-aiplatform.googleapis.com/v1/${MODEL}:predict" \
+            -d "{\"instances\":[{\"prompt\":\"${PROMPT_ESCAPED}\"}],\"parameters\":{\"sampleCount\":1,\"sampleImageSize\":{\"width\":512,\"height\":512}}}" \
+          | jq -r '.predictions[0].bytesBase64Encoded' \
+          | base64 -d > logo-ai.png || true
+
+          if [ -s logo-ai.png ]; then
+            mkdir -p "$THEME_DIR/assets/img"
+            mv logo-ai.png "$THEME_DIR/assets/img/logo.png"
+            echo "AI logo generated at $THEME_DIR/assets/img/logo.png"
+          else
+            echo "AI logo generation failed or empty; keeping SVG fallback"
+          fi
+
+          # style.css
+          cat > "$THEME_DIR/style.css" << EOF
+          /*
+          Theme Name: ${NAME}
+          Description: AI-generated professional website built with SiteFuse
+          Template: sitefuse-base
+          Text Domain: ${SLUG}-child
+          Version: 1.2.0
+          */
+          EOF
+
+          # functions.php
+          cat > "$THEME_DIR/functions.php" << 'EOF'
+          <?php
+          add_action('wp_enqueue_scripts', function () {
+              $parent_css = get_template_directory_uri() . '/dist/tailwind.css';
+              wp_enqueue_style('sitefuse-parent', $parent_css, [], null);
+              $child_css_path = get_stylesheet_directory() . '/dist/tailwind.css';
+              $child_css_ver = file_exists($child_css_path) ? filemtime($child_css_path) : '1.0.0';
+              wp_enqueue_style('sitefuse-child', get_stylesheet_directory_uri() . '/dist/tailwind.css', ['sitefuse-parent'], $child_css_ver);
+              wp_enqueue_script('sitefuse-theme', get_stylesheet_directory_uri() . '/assets/js/theme.js', [], $child_css_ver, true);
+          });
+          add_action('after_setup_theme', function () {
+              add_theme_support('post-thumbnails');
+              add_theme_support('custom-logo');
+              add_theme_support('title-tag');
+              register_nav_menus(['primary' => 'Primary Navigation', 'footer' => 'Footer Navigation']);
+          });
+          function get_theme_image($image_name, $fallback_url = '') {
+              $theme_image = get_stylesheet_directory_uri() . '/assets/img/' . $image_name;
+              $theme_path = get_stylesheet_directory() . '/assets/img/' . $image_name;
+              if (file_exists($theme_path)) return $theme_image;
+              return $fallback_url ?: 'https://images.unsplash.com/photo-1497366216548-37526070297c?w=800&h=600&fit=crop';
+          }
+          EOF
+
+          # Enhanced CSS with all block type support
+          cat > "$THEME_DIR/assets/css/tailwind.css" << EOF
+          @tailwind base;
+          @tailwind components;
+          @tailwind utilities;
+
+          @layer base {
+            :root {
+              --color-brand-primary: ${BRAND};
+              --color-brand-secondary: #3b82f6;
+              --color-brand-accent: ${ACCENT};
+              --color-cream: #fefaf6;
+              --color-dark: #1f2937;
+              --color-text: #111827;
+              --color-bg: #f8fafc;
+            }
+            
+            html { 
+              scroll-behavior: smooth; 
+            }
+            
+            body {
+              font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+              line-height: 1.7;
+              color: var(--color-text);
+              background-color: var(--color-bg);
+              -webkit-font-smoothing: antialiased;
+              -moz-osx-font-smoothing: grayscale;
+            }
+
+            h1, h2, h3, h4, h5, h6 {
+              font-weight: 700;
+              line-height: 1.2;
+              color: var(--color-dark);
+            }
+
+            /* Dynamic color classes */
+            .text-primary { color: var(--color-brand-primary) !important; }
+            .bg-primary { background-color: var(--color-brand-primary) !important; }
+            .border-primary { border-color: var(--color-brand-primary) !important; }
+            .ring-primary { --tw-ring-color: var(--color-brand-primary) !important; }
+          }
+
+          @layer components {
+            .container { 
+              width: 100%; 
+              margin: 0 auto; 
+              padding: 0 1rem; 
+              max-width: 80rem; 
+            }
+            
+            @media (min-width: 640px) {
+              .container { padding: 0 1.5rem; }
+            }
+            
+            @media (min-width: 1024px) {
+              .container { padding: 0 2rem; }
+            }
+
+            /* Button Components */
+            .btn { 
+              @apply inline-flex items-center justify-center px-6 py-3 text-base font-semibold rounded-xl transition-all duration-300 text-center no-underline cursor-pointer border-0;
+              box-shadow: 0 4px 14px 0 rgba(0, 0, 0, 0.1);
+            }
+            
+            .btn:hover {
+              transform: translateY(-1px);
+              box-shadow: 0 8px 25px 0 rgba(0, 0, 0, 0.15);
+            }
+            
+            .btn-primary { 
+              background: linear-gradient(135deg, var(--color-brand-primary) 0%, var(--color-brand-accent) 100%);
+              color: white;
+            }
+            
+            .btn-primary:hover {
+              background: linear-gradient(135deg, var(--color-brand-accent) 0%, var(--color-brand-primary) 100%);
+              color: white;
+            }
+            
+            .btn-secondary { 
+              background: white;
+              color: var(--color-brand-primary);
+              border: 2px solid var(--color-brand-primary);
+            }
+            
+            .btn-secondary:hover {
+              background: var(--color-brand-primary);
+              color: white;
+            }
+
+            /* Typography */
+            .section-title { 
+              @apply text-4xl md:text-5xl font-bold text-center mb-4;
+              color: var(--color-dark);
+              line-height: 1.1;
+            }
+
+            .hero-section { 
+              @apply relative min-h-screen flex items-center justify-center overflow-hidden;
+            }
+
+            .hero-section .container {
+              @apply relative z-20;
+            }
+
+            /* Prose styling for content areas */
+            .prose {
+              @apply text-gray-600 leading-relaxed;
+            }
+            
+            .prose h1, .prose h2, .prose h3, .prose h4 {
+              @apply text-gray-900 font-bold mb-4;
+            }
+            
+            .prose h1 { @apply text-3xl; }
+            .prose h2 { @apply text-2xl; }
+            .prose h3 { @apply text-xl; }
+            
+            .prose p {
+              @apply mb-4;
+            }
+            
+            .prose ul, .prose ol {
+              @apply ml-6 mb-4;
+            }
+            
+            .prose li {
+              @apply mb-2;
+            }
+            
+            .prose-lg {
+              @apply text-lg leading-relaxed;
+            }
+            
+            .prose-xl {
+              @apply text-xl leading-relaxed;
+            }
+
+            /* Card Components */
+            .card {
+              @apply bg-white rounded-xl shadow-lg p-6 transition-all duration-300;
+            }
+            
+            .card:hover {
+              @apply shadow-xl;
+              transform: translateY(-2px);
+            }
+
+            /* Navigation styling */
+            nav ul {
+              @apply flex list-none m-0 p-0;
+              gap: 1.5rem;
+            }
+
+            nav ul li {
+              @apply m-0;
+            }
+
+            nav ul li a {
+              @apply text-gray-700 font-medium no-underline transition-colors duration-200;
+            }
+
+            nav ul li a:hover {
+              color: var(--color-brand-primary);
+            }
+          }
+
+          /* Mobile-first responsive utilities */
+          @media (max-width: 640px) {
+            .section-title { @apply text-3xl; }
+            .hero-section { @apply min-h-[70vh]; }
+            .container { @apply px-4; }
+          }
+          EOF
+
+          # Ensure a distributable CSS file exists for enqueue
+          mkdir -p "$THEME_DIR/dist"
+          if [ -s "$THEME_DIR/assets/css/tailwind.css" ]; then
+            cp "$THEME_DIR/assets/css/tailwind.css" "$THEME_DIR/dist/tailwind.css"
+          else
+            echo "/* minimal */" > "$THEME_DIR/dist/tailwind.css"
+          fi
+
+          # include website.json for deploy
+          cp website.json "$THEME_DIR/"
+
+      - name: Build Tailwind CSS
+        env:
+          SLUG: ${{ steps.config.outputs.slug }}
+        run: |
+          set -e
+          curl -sL https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.1/tailwindcss-linux-x64 -o tailwindcss
+          chmod +x tailwindcss
+          THEME_DIR="${SLUG}-child"
+          # Ensure input exists even if previous step was skipped in a retry
+          if [ ! -f "$THEME_DIR/assets/css/tailwind.css" ]; then
+            echo "::warning::Missing $THEME_DIR/assets/css/tailwind.css — creating minimal input"
+            mkdir -p "$THEME_DIR/assets/css" "$THEME_DIR/dist"
+            printf '%s\n%s\n%s\n' '@tailwind base;' '@tailwind components;' '@tailwind utilities;' > "$THEME_DIR/assets/css/tailwind.css"
+          fi
+          cat > "$THEME_DIR/tailwind.config.js" << 'EOF'
+          module.exports = {
+            content: ['./**/*.php'],
+            safelist: [
+              // Core components
+              'container','btn','btn-primary','btn-secondary','section-title','hero-section',
+              'card','prose','prose-lg','prose-xl',
+              
+              // Layout & spacing
+              'py-16','py-20','py-24','px-4','px-6','px-8','mb-4','mb-6','mb-8','mb-16',
+              'mt-4','mt-6','mt-8','space-y-2','space-y-4','space-y-6','space-y-8',
+              
+              // Grid & flex
+              'grid','gap-4','gap-6','gap-8','gap-12','flex','items-center','items-start',
+              'justify-between','justify-center','grid-cols-1','grid-cols-2','grid-cols-3','grid-cols-4',
+              'md:grid-cols-2','lg:grid-cols-3','lg:grid-cols-4','auto-cols-fr',
+              
+              // Typography
+              'text-sm','text-base','text-lg','text-xl','text-2xl','text-3xl','text-4xl','text-5xl','text-6xl',
+              'font-medium','font-semibold','font-bold','leading-relaxed','text-center','text-left',
+              'italic','tracking-wide',
+              
+              // Colors
+              'text-white','text-gray-600','text-gray-700','text-gray-900','text-green-500','text-green-600',
+              'text-primary','text-yellow-400','bg-white','bg-gray-50','bg-gray-100','bg-gray-900',
+              'bg-primary','bg-secondary','bg-green-100',
+              
+              // Effects
+              'shadow','shadow-lg','shadow-xl','rounded-lg','rounded-xl','rounded-2xl','rounded-full',
+              'transition-all','duration-200','duration-300','hover:shadow-xl','group-hover:opacity-100',
+              'opacity-0','opacity-90','opacity-100','backdrop-blur-md',
+              
+              // Positioning
+              'relative','absolute','inset-0','top-0','z-10','z-20','z-40','sticky',
+              'min-h-screen','min-h-[70vh]','aspect-square','overflow-hidden',
+              
+              // Responsive
+              'max-w-none','max-w-2xl','max-w-3xl','max-w-4xl','max-w-5xl','mx-auto',
+              'w-full','w-8','w-16','w-24','h-8','h-16','h-20','h-24','flex-1','flex-shrink-0',
+              
+              // Borders
+              'border','border-b','border-2','border-gray-200','border-transparent',
+              'ring-2','ring-primary',
+              
+              // Special utilities
+              'antialiased','whitespace-nowrap','cursor-pointer','transform','hover:transform',
+              'hover:scale-105','group','last:border-b-0'
+            ],
+            theme: { 
+              extend: {
+                colors: {
+                  'primary': 'var(--color-brand-primary)',
+                  'secondary': 'var(--color-brand-secondary)',
+                  'accent': 'var(--color-brand-accent)',
+                },
+                fontFamily: {
+                  'heading': ['var(--font-heading)', 'system-ui', 'sans-serif'],
+                  'body': ['var(--font-body)', 'system-ui', 'sans-serif'],
+                }
+              }
+            },
+            plugins: []
+          }
+          EOF
+          ./tailwindcss --config "$THEME_DIR/tailwind.config.js" --input "$THEME_DIR/assets/css/tailwind.css" --output "$THEME_DIR/dist/tailwind.css" --minify
+
+      - name: Create theme JavaScript file
+        env:
+          SLUG: ${{ steps.config.outputs.slug }}
+        run: |
+          THEME_DIR="${SLUG}-child"
+          cat > "$THEME_DIR/assets/js/theme.js" << 'EOF'
+          // Theme JavaScript
+          document.addEventListener('DOMContentLoaded', function() {
+              console.log('Theme JS loaded');
+              // Add interactive functionality here
+          });
+          EOF    
+      - name: Generate PHP templates (Gutenberg authoritative)
+        env:
+          SLUG: ${{ steps.config.outputs.slug }}
+          NAME: ${{ steps.config.outputs.name }}
+        run: |
+          set -e
+          THEME_DIR="${SLUG}-child"
+
+          # Ensure theme stylesheet exists (required by WP). Overwrite to be deterministic.
+          cat > "$THEME_DIR/style.css" << EOF
+          /*
+          Theme Name: ${NAME}
+          Description: AI-generated professional website built with SiteFuse
+          Template: sitefuse-base
+          Text Domain: ${SLUG}-child
+          Version: 1.2.0
+          */
+          EOF
+
+          # Ensure minimal functions.php exists (enqueue parent/child CSS and menus)
+          cat > "$THEME_DIR/functions.php" << 'EOF'
+          <?php
+          add_action('wp_enqueue_scripts', function () {
+              $parent_css = get_template_directory_uri() . '/dist/tailwind.css';
+              wp_enqueue_style('sitefuse-parent', $parent_css, [], null);
+              $child_css_path = get_stylesheet_directory() . '/dist/tailwind.css';
+              $child_css_ver = file_exists($child_css_path) ? filemtime($child_css_path) : '1.0.0';
+              wp_enqueue_style('sitefuse-child', get_stylesheet_directory_uri() . '/dist/tailwind.css', ['sitefuse-parent'], $child_css_ver);
+              wp_enqueue_script('sitefuse-theme', get_stylesheet_directory_uri() . '/assets/js/theme.js', [], $child_css_ver, true);
+          });
+          add_action('after_setup_theme', function () {
+              add_theme_support('post-thumbnails');
+              add_theme_support('custom-logo');
+              add_theme_support('title-tag');
+              register_nav_menus(['primary' => 'Primary Navigation', 'footer' => 'Footer Navigation']);
+          });
+          function get_theme_image($image_name, $fallback_url = '') {
+              $theme_image = get_stylesheet_directory_uri() . '/assets/img/' . $image_name;
+              $file_path = get_stylesheet_directory() . '/assets/img/' . $image_name;
+              if (file_exists($file_path)) return $theme_image;
+              return $fallback_url;
+          }
+          EOF
+
+          # front-page.php renders Gutenberg content directly (no shortcode)
+          cat > "$THEME_DIR/front-page.php" << 'EOF'
+          <?php get_header(); ?>
+          <main id="main" class="site-main">
+            <?php if (have_posts()): while (have_posts()): the_post(); ?>
+              <article class="entry-content">
+                <?php the_content(); ?>
+              </article>
+            <?php endwhile; endif; ?>
+          </main>
+          <?php get_footer(); ?>
+          EOF
+
+          # header.php
+          cat > "$THEME_DIR/header.php" << 'EOF'
+          <!DOCTYPE html>
+          <html <?php language_attributes(); ?>>
+          <head>
+            <meta charset="<?php bloginfo('charset'); ?>">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <?php wp_head(); ?>
+          </head>
+          <body <?php body_class('font-sans antialiased'); ?>>
+            <header class="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b">
+              <div class="container">
+                <div class="flex items-center justify-between h-20">
+                  <a href="<?php echo esc_url(home_url('/')); ?>" class="flex items-center gap-3 no-underline">
+                    <?php 
+                      $logo_png = get_stylesheet_directory() . '/assets/img/logo.png';
+                      $logo_svg = get_stylesheet_directory() . '/assets/img/logo.svg';
+                      $url_png  = get_stylesheet_directory_uri() . '/assets/img/logo.png';
+                      $url_svg  = get_stylesheet_directory_uri() . '/assets/img/logo.svg';
+                      if (file_exists($logo_png)) {
+                        echo '<img src="'.esc_url($url_png).'" alt="'.esc_attr(get_bloginfo('name')).'" class="h-10 w-auto" />';
+                      } elseif (file_exists($logo_svg)) {
+                        echo '<img src="'.esc_url($url_svg).'" alt="'.esc_attr(get_bloginfo('name')).'" class="h-10 w-auto" />';
+                      }
+                    ?>
+                    <span class="text-2xl font-bold" style="color: var(--color-brand-primary);"><?php bloginfo('name'); ?></span>
+                  </a>
+                  <nav class="hidden lg:block">
+                    <?php wp_nav_menu([
+                      'theme_location' => 'primary',
+                      'container' => false,
+                      'menu_class' => '',
+                      'fallback_cb' => false
+                    ]); ?>
+                  </nav>
+                </div>
+              </div>
+            </header>
+          EOF
+
+          # footer.php
+          cat > "$THEME_DIR/footer.php" << 'EOF'
+          <footer class="bg-gray-900 text-gray-300 mt-20">
+            <div class="container py-16">
+              <div class="grid gap-8 lg:grid-cols-3 items-start">
+                <div class="text-center lg:text-left">
+                  <h3 class="text-2xl font-bold mb-4"><?php bloginfo('name'); ?></h3>
+                  <p class="opacity-80"><?php echo esc_html(get_bloginfo('description')); ?></p>
+                </div>
+                <div class="text-center">
+                  <?php if (has_nav_menu('footer')): ?>
+                    <nav>
+                      <?php wp_nav_menu([
+                        'theme_location' => 'footer',
+                        'container' => false,
+                        'menu_class' => '',
+                        'fallback_cb' => false
+                      ]); ?>
+                    </nav>
+                  <?php endif; ?>
+                </div>
+                <div class="text-center lg:text-right">
+                  <?php
+                  $socials = [];
+                  $cfg_path = ABSPATH . 'website.json';
+                  if (is_readable($cfg_path)) {
+                    $cfg = json_decode(file_get_contents($cfg_path), true);
+                    if (isset($cfg['brand']['socials']) && is_array($cfg['brand']['socials'])) {
+                      $socials = $cfg['brand']['socials'];
+                    }
+                  }
+                  if (!empty($socials)) {
+                    echo '<div class="flex gap-4 justify-center lg:justify-end">';
+                    foreach ($socials as $s) {
+                      $label = esc_html($s['label'] ?? ($s['platform'] ?? '')); 
+                      $url = esc_url($s['url'] ?? '#');
+                      if ($label && $url) {
+                        echo '<a class="no-underline hover:underline" href="' . $url . '" target="_blank" rel="noopener">' . $label . '</a>';
+                      }
+                    }
+                    echo '</div>';
+                  }
+                  ?>
+                </div>
+              </div>
+              <div class="text-center mt-8 text-sm opacity-80">© <?php echo date('Y'); ?> <?php bloginfo('name'); ?>. All rights reserved.</div>
+            </div>
+            <?php wp_footer(); ?>
+          </body>
+          </html>
+          EOF
+
+          # index.php
+          cat > "$THEME_DIR/index.php" << 'EOF'
+          <?php get_header(); ?>
+          <main id="main" class="container py-20">
+            <?php if (have_posts()) : while (have_posts()) : the_post(); the_content(); endwhile; endif; ?>
+          </main>
+          <?php get_footer(); ?>
+          EOF
+
+          # front-page.php – render editor content only
+          cat > "$THEME_DIR/front-page.php" << 'EOF'
+          <?php get_header(); ?>
+          <main id="primary" class="site-main container py-10">
+            <?php if ( have_posts() ) : while ( have_posts() ) : the_post(); the_content(); endwhile; endif; ?>
+          </main>
+          <?php get_footer(); ?>
+          EOF
+
+          # page.php – render editor content only
+          cat > "$THEME_DIR/page.php" << 'EOF'
+          <?php get_header(); ?>
+          <main id="primary" class="site-main container py-10">
+            <?php if ( have_posts() ) : while ( have_posts() ) : the_post(); the_content(); endwhile; endif; ?>
+          </main>
+          <?php get_footer(); ?>
+          EOF
+
+      - name: Upload built theme
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: theme-${{ steps.config.outputs.slug }}-${{ github.run_id }}
+          path: ${{ steps.config.outputs.slug }}-child/
+          retention-days: 1
+
+      - name: Produce build run summary
+        if: ${{ always() }}
+        env:
+          SLUG: ${{ steps.config.outputs.slug }}
+          NAME: ${{ steps.config.outputs.name }}
+        run: |
+          set -e
+          mkdir -p run-summary
+          THEME_DIR="${SLUG}-child"
+          HAS_STYLE=$([ -f "$THEME_DIR/style.css" ] && echo 1 || echo 0)
+          HAS_FUNCS=$([ -f "$THEME_DIR/functions.php" ] && echo 1 || echo 0)
+          jq -n --arg slug "$SLUG" --arg name "$NAME" \
+            --argjson style "$HAS_STYLE" --argjson funcs "$HAS_FUNCS" \
+            '{build: {slug: $slug, name: $name, style_css: ($style==1), functions_php: ($funcs==1)}}' \
+            > run-summary/build.json
+
+      - name: Upload run summary (Build)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-summary-build-${{ github.run_id }}
+          path: run-summary/build.json
+          retention-days: 3

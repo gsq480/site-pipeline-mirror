@@ -1,0 +1,23 @@
+{
+  "name": "sitefuse-agency",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "tailwindcss --input ./assets/css/tailwind.css --output ./dist/tailwind.css --minify",
+    "watch": "tailwindcss --input ./assets/css/tailwind.css --output ./dist/tailwind.css --watch"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.11",
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.11"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "yaml": "^2.8.1",
+    "jose": "^5.9.3",
+    "node-fetch": "^3.3.2",
+    "sharp": "^0.33.5"
+  }
+}

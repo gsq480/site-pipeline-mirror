@@ -1,0 +1,130 @@
+name: From Figma Export
+
+on:
+  repository_dispatch:
+    types: [figma-export]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Deploy after build'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false','true']
+      strict_mode:
+        description: 'Fail build if unknown blocks are found'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false','true']
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    outputs:
+      config_artifact: website-config-${{ github.run_id }}
+      slug: ${{ steps.extract.outputs.slug }}
+      name: ${{ steps.extract.outputs.name }}
+      tagline: ${{ steps.extract.outputs.tagline }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine options
+        id: opts
+        run: |
+          DEPLOY_INPUT='${{ github.event.client_payload.deploy }}'
+          STRICT_INPUT='${{ github.event.client_payload.strict_mode }}'
+          if [ -z "$DEPLOY_INPUT" ]; then DEPLOY_INPUT='${{ github.event.inputs.deploy }}'; fi
+          if [ -z "$STRICT_INPUT" ]; then STRICT_INPUT='${{ github.event.inputs.strict_mode }}'; fi
+          echo "deploy=${DEPLOY_INPUT:-false}" >> $GITHUB_OUTPUT
+          echo "strict=${STRICT_INPUT:-false}" >> $GITHUB_OUTPUT
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Fetch design-spec.json from WP
+        env:
+          ORIGIN: ${{ vars.SITEFUSE_WP_ORIGIN }}
+        run: |
+          set -euo pipefail
+          test -n "${ORIGIN:-}" || { echo "SITEFUSE_WP_ORIGIN repo variable is not set"; exit 1; }
+          URL="$ORIGIN/wp-content/uploads/sitefuse/design-spec.json"
+          echo "Fetching: $URL"
+          curl -fsSL "$URL" -o design-spec.json
+          jq length design-spec.json >/dev/null
+
+      - name: Convert design-spec → website.json
+        run: |
+          node tools/from-figma-export.mjs --in design-spec.json --out website.json
+          echo "--- from-figma-report.txt ---"
+          cat from-figma-report.txt || true
+
+      - name: Validate website.json
+        run: |
+          STRICT_FLAG=""
+          if [ "${{ steps.opts.outputs.strict }}" = "true" ]; then STRICT_FLAG="--strict"; fi
+          node tools/validate-website.mjs --in website.json --config blocks-config.json --out website.json $STRICT_FLAG
+
+      - name: Upload configuration artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-config-${{ github.run_id }}
+          path: |
+            website.json
+            from-figma-report.txt
+          retention-days: 1
+
+      - name: Extract values
+        id: extract
+        run: |
+          echo "slug=$(jq -r '.slug // "business-site"' website.json)"        >> $GITHUB_OUTPUT
+          echo "name=$(jq -r '.name // "Your Business"' website.json)"        >> $GITHUB_OUTPUT
+          echo "tagline=$(jq -r '.tagline // "Professional services"' website.json)" >> $GITHUB_OUTPUT
+
+      - name: Commit website.json
+        run: |
+          git config user.name  "SiteFuse Bot"
+          git config user.email "bot@sitefuse.app"
+          git add website.json || true
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: update website.json from Figma export"
+            git push
+          fi
+
+      - name: Summary
+        run: |
+          echo "## From Figma Export" >> $GITHUB_STEP_SUMMARY
+          echo "- Slug: ${{ steps.extract.outputs.slug }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Strict mode: ${{ steps.opts.outputs.strict }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Report:" >> $GITHUB_STEP_SUMMARY
+          echo '\n```' >> $GITHUB_STEP_SUMMARY
+          (cat from-figma-report.txt || echo 'No report') >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  build:
+    needs: convert
+    uses: ./.github/workflows/02-build-theme.yml
+    with:
+      config_artifact: ${{ needs.convert.outputs.config_artifact }}
+      strict_mode: ${{ needs.convert.outputs.strict }}
+    secrets: inherit
+
+  deploy:
+    needs: [convert, build]
+    if: ${{ needs.convert.outputs.strict != 'true' || success() }}
+    uses: ./.github/workflows/03-deploy.yml
+    with:
+      theme_artifact: theme-${{ needs.convert.outputs.slug }}-${{ github.run_id }}
+      slug:    ${{ needs.convert.outputs.slug }}
+      name:    ${{ needs.convert.outputs.name }}
+      tagline: ${{ needs.convert.outputs.tagline }}
+    secrets: inherit
+

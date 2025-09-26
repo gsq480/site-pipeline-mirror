@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "blocks": [
+    {
+      "type": "testimonials",
+      "label": "block/testimonials",
+      "category": "testimonials",
+      "supports_images": true,
+      "industries": [
+        "all"
+      ],
+      "inputs": {
+        "title": "text",
+        "subtitle": "text"
+      },
+      "defaults": {
+        "title": "Example",
+        "subtitle": ""
+      },
+      "id": "1:6",
+      "key": "f8f8ade6045461af6451d424b61e0862653066d0",
+      "type_source": "figma-component"
+    },
+    {
+      "type": "hero",
+      "label": "block/hero",
+      "category": "hero",
+      "supports_images": true,
+      "industries": [
+        "all"
+      ],
+      "inputs": {
+        "title": "text",
+        "subtitle": "text"
+      },
+      "defaults": {
+        "title": "Example",
+        "subtitle": ""
+      },
+      "id": "1:4",
+      "key": "6031c4fea2c4aaab9ca0cb274108ebf63c8a5e52",
+      "type_source": "figma-component"
+    }
+  ]
+}

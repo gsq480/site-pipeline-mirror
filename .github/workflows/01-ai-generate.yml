@@ -1,0 +1,543 @@
+# .github/workflows/01-ai-generate.yml
+name: Generate Website Configuration
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Describe your website'
+        required: true
+        type: string
+      industry:
+        description: 'Industry type'
+        required: false
+        type: string
+        default: 'auto-detect'
+      generate_images:
+        description: 'Generate AI images'
+        required: false
+        type: boolean
+        default: false
+
+  workflow_call:
+    inputs:
+      prompt:
+        required: true
+        type: string
+      industry:
+        required: false
+        type: string
+        default: 'auto-detect'
+      generate_images:
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      config_artifact:
+        description: "Generated website configuration artifact name"
+        value: website-config-${{ github.run_id }}
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate website configuration
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          echo "Prompt: ${{ inputs.prompt }}"
+          echo "Industry: ${{ inputs.industry }}"
+          echo "Generate images: ${{ inputs.generate_images }}"
+
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: OPENAI_API_KEY is not set"
+            exit 1
+          fi
+
+          cat > system_prompt.txt << 'EOF'
+          You are a senior UX designer and content strategist. Your job is to analyze the user's request and create a UNIQUE, custom website structure that perfectly fits their specific business needs.
+
+          IMPORTANT: Make each site completely different! Vary the number of sections, content types, and layout based on what makes sense for that specific business.
+
+          Available block types you can use:
+          - hero: Hero section with title, subtitle, CTA, background image
+          - features: Grid of feature cards (2-4 columns)
+          - services: Service offerings in cards
+          - testimonial: Single testimonial quote
+          - testimonials: Multiple testimonials grid
+          - cta: Call-to-action section
+          - about: About us content
+          - portfolio: Portfolio/gallery grid
+          - team: Team member cards
+          - pricing: Pricing tables
+          - faq: Frequently asked questions
+          - contact-form: Contact form section
+          - stats: Statistics/numbers section
+          - process: Step-by-step process
+          - benefits: Benefits grid
+          - locations: Multiple locations
+          - menu: Restaurant/cafe menu
+          - classes: Class schedules (yoga, fitness, etc)
+          - gallery: Image gallery
+          - blog-preview: Recent blog posts
+          - newsletter: Email signup
+          - social-proof: Logos/brands
+          - two-col: Two column content
+          - three-col: Three column content
+          - full-width-text: Full width text section
+          - video: Video section
+          - map: Location map
+          - hours: Business hours
+          - booking: Appointment booking
+            
+          IMAGE-FRIENDLY BLOCK SHAPES, REQUIRED FIELDS:
+          - hero: { title, subtitle, cta, image: "", overlay }  leave hero.image empty, it will be generated later
+          - gallery: { title?, images: [ { alt: "meaningful description", url: "" }, ... ] }  always include 6–12 images with alt and leave url empty
+          - team: { title?, members: [ { name, role, bio, photo: "" }, ... ] }  leave photo empty
+          - services: { title?, items: [ { title, text, price?, icon: "" }, ... ] }  leave icon empty  
+
+          DESIGN VARIETY RULES:
+          1. Restaurants/Cafes: 6-10 sections (hero, menu, about, gallery, reviews, hours, contact)
+          2. Yoga Studios: 4-7 sections (hero, classes, benefits, testimonials, pricing, contact)
+          3. Law Firms: 5-8 sections (hero, services, about, team, testimonials, cta, contact)
+          4. Photography: 4-6 sections (hero, portfolio, about, services, testimonials, contact)
+          5. Consulting: 6-9 sections (hero, services, process, about, testimonials, stats, cta, contact)
+          6. Medical: 5-8 sections (hero, services, about, team, hours, insurance, contact)
+          7. Real Estate: 6-10 sections (hero, listings, services, about, testimonials, stats, contact)
+          8. Retail: 5-9 sections (hero, products, about, benefits, reviews, cta, contact)
+
+          Return ONLY valid JSON in this schema:
+          {
+            "slug": "unique-kebab-case-name",
+            "name": "Creative Business Name",
+            "tagline": "Compelling unique tagline",
+            "industry": "detected-industry",
+            "style": {
+              "recipe": "minimal|editorial|brutalist|elegant|playful|tech",
+              "variant": "a|b|c",
+              "shapes": "squircle|angled|soft",
+              "radius": 4|6|8|12|16,
+              "elev": "low|med|high"
+            },
+            "brand": {
+              "colors": {
+                "primary": "#hex-color",
+                "secondary": "#hex-color", 
+                "accent": "#hex-color",
+                "bg": "#hex-color",
+                "text": "#hex-color"
+              },
+              "fonts": {
+                "heading": "Google-Font-Name",
+                "body": "Google-Font-Name"
+              }
+            },
+            "hero": {
+              "title": "Compelling headline specific to business",
+              "subtitle": "Benefit-focused subtitle that's unique",
+              "cta": {"label": "Action-oriented CTA", "href": "#contact"},
+              "image": "",
+              "overlay": 0.2-0.5
+            },
+            "pages": [
+              {
+                "slug": "home",
+                "title": "Home", 
+                "layout": "landing",
+                "blocks": [
+                  // CUSTOMIZE THIS ARRAY! Make it unique for each business type
+                  // Use different combinations and quantities of blocks
+                  // Write specific, engaging content for each block
+                  {"type": "hero"},
+                  // Add 3-12 more blocks that make sense for this specific business
+                ]
+              }
+            ]
+          }
+
+          CONTENT RULES:
+          - Write specific, engaging copy that sounds natural for that business type
+          - Use industry-specific terminology and benefits
+          - Make testimonials sound authentic with realistic names
+          - Vary the number and types of sections dramatically between different prompts
+          - Choose colors that match the industry and mood (warm for restaurants, professional for law, calming for yoga, etc.)
+          - Use verified working Unsplash photo IDs from these categories:
+            * Spa/Wellness: 1540979388821-28d9b8e4cf88, 1571019613454-1cb2f99b2d8b, 1506905925346-21bda4d32df4
+            * Restaurant/Food: 1517248135467-4c7edcad34c4, 1504674900247-0877df9cc836, 1552566626-52f8b28a1ff1
+            * Business/Office: 1497366216548-37526070297c, 1589829545856-d10d557cf95f, 1423666639041-f56206448028
+            * Photography: 1452587925148-ce544e77e70d, 1606983340077-e4d9b3a5d6b9, 1516035069371-29a1b244cc32
+            * Law/Professional: 1589829545856-d10d557cf95f, 1521737711867-e3b97375f902, 1560472354-b33ff0c44a5a
+          - Use Google Fonts that match the business personality
+          IMAGE PLACEHOLDER RULES:
+          - Do not insert stock URLs for hero, gallery, team photos, or service icons
+          - Always include the fields listed above and leave image URLs empty strings ""
+          - Provide rich, specific alt text for each gallery image so a downstream process can generate accurate visuals
+          - Write realistic people names and roles for team members so portraits can be generated
+          - Do not use the Unsplash IDs list for hero, gallery, team photos, or service icons, leave those URLs empty; other blocks may still use stock images if needed.
+
+          UNIQUENESS REQUIREMENTS:
+          - No two sites should have the same section combination
+          - Content should be specific to the business type and prompt
+          - Visual style should vary significantly
+          - Section order should make logical sense for that business
+          - Always include hero first, contact/CTA toward the end
+          EOF
+
+          SYSTEM_PROMPT=$(cat system_prompt.txt)
+          USER_PROMPT="Create a unique website configuration for: ${{ inputs.prompt }}. Industry context: ${{ inputs.industry }}. Make this completely different from any other site - unique sections, content, and structure that perfectly fits this specific business."
+
+          jq -n \
+            --arg model "gpt-4o" \
+            --arg system_content "$SYSTEM_PROMPT" \
+            --arg user_content "$USER_PROMPT" \
+            '{
+              model: $model,
+              response_format: {type: "json_object"},
+              temperature: 1.1,
+              max_tokens: 4000,
+              messages: [
+                {role: "system", content: $system_content},
+                {role: "user", content: $user_content}
+              ]
+            }' > payload.json
+
+          echo "Calling OpenAI API..."
+          HTTP_CODE=$(curl -w "%{http_code}" -o api_response.json -s \
+            -X POST "https://api.openai.com/v1/chat/completions" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @payload.json)
+
+          echo "HTTP Status Code: $HTTP_CODE"
+
+          USE_FALLBACK=false
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "API error"
+            cat api_response.json || true
+            USE_FALLBACK=true
+          else
+            if jq -e '.choices[0].message.content' api_response.json >/dev/null 2>&1; then
+              jq -r '.choices[0].message.content' api_response.json > website.json || USE_FALLBACK=true
+              if ! jq empty website.json >/dev/null 2>&1; then
+                echo "Model returned invalid JSON"
+                USE_FALLBACK=true
+              fi
+            else
+              echo "No content in API response"
+              USE_FALLBACK=true
+            fi
+          fi
+
+          if [ "$USE_FALLBACK" = "true" ]; then
+            echo "Using fallback configuration"
+            cat > website.json << 'JSON'
+          {
+            "slug": "unique-business-site",
+            "name": "Custom Business",
+            "tagline": "Tailored solutions for your needs", 
+            "industry": "business",
+            "brand": {
+              "colors": {
+                "primary": "#2563eb",
+                "secondary": "#3b82f6", 
+                "accent": "#1d4ed8",
+                "bg": "#f8fafc",
+                "text": "#111827"
+              },
+              "fonts": {
+                "heading": "Inter",
+                "body": "Inter"
+              }
+            },
+            "hero": {
+              "title": "Your Custom Business Solution",
+              "subtitle": "Professionally crafted services",
+              "cta": {"label": "Get Started", "href": "#contact"},
+              "image": "",
+              "overlay": 0.35
+            },
+            "pages": [
+              {
+                "slug": "home",
+                "title": "Home",
+                "layout": "landing", 
+                "blocks": [
+                  {"type": "hero"},
+                  {"type": "features", "columns": 3, "items": [
+                    {"title": "Quality Service", "text": "We deliver excellence in everything we do."},
+                    {"title": "Fast Response", "text": "Quick turnaround times for all projects."},
+                    {"title": "Expert Support", "text": "Professional guidance every step of the way."}
+                  ]},
+                  {"type": "about", "title": "About Us", "content": "We are dedicated professionals committed to your success."},
+                  {"type": "testimonial", "quote": "Outstanding service and results!", "author": "Sarah Johnson"},
+                  {"type": "cta", "text": "Ready to get started?", "button": {"label": "Contact Us", "href": "#contact"}},
+                  {"type": "contact-form"}
+                ]
+              }
+            ]
+          }
+          JSON
+          fi
+
+      - name: Validate and enhance generated config
+        run: |
+          set -euo pipefail
+          
+          # Ensure required fields exist and add any missing defaults
+          jq -S '
+            .slug        //= ("generated-site-" + (now | tostring)) |
+            .name        //= "Generated Business" |
+            .tagline     //= "Professional services" |
+            .industry    //= "business" |
+            .style       //= {"recipe": "elegant", "variant": "a", "shapes": "soft", "radius": 8, "elev": "med"} |
+            .brand.colors //= {"primary":"#2563eb","secondary":"#3b82f6","accent":"#1d4ed8","bg":"#f8fafc","text":"#111827"} |
+            .brand.fonts  //= {"heading":"Inter","body":"Inter"} |
+            .hero        //= {} |
+            .hero.overlay //= 0.35 |
+            .hero.image   //= "" |
+            .pages       //= [{"slug":"home","title":"Home","layout":"landing","blocks":[{"type":"hero"}]}] |
+
+            # Ensure home starts with hero
+            (.pages |= map(
+              if .slug == "home" and ((.blocks|length) > 0 and (.blocks[0].type != "hero")) 
+                then .blocks = ([{"type":"hero"}] + .blocks) 
+                else . end
+            )) |
+
+            # Ensure gallery, team, services placeholders exist and are shaped correctly
+            (.pages |= map(
+              .blocks |= map(
+                if .type == "gallery" then
+                  .images = ((.images // []) 
+                    | map({
+                        alt: (.alt // "Gallery image"),
+                        url: (.url // "")
+                      }))
+                  | (if (.images|length) == 0 then
+                      [{alt:"Gallery image 1",url:""},{alt:"Gallery image 2",url:""},{alt:"Gallery image 3",url:""}]
+                    else . end)
+                elif .type == "team" then
+                  .members = ((.members // []) 
+                    | map({
+                        name: (.name // "Team Member"),
+                        role: (.role // "Role"),
+                        bio:  (.bio  // ""),
+                        photo: (.photo // "")
+                      }))
+                elif .type == "services" then
+                  .items = ((.items // [])
+                    | map({
+                        title: (.title // "Service"),
+                        text:  (.text  // ""),
+                        price: (.price // null),
+                        icon:  (.icon  // "")
+                      }))
+                else .
+                end
+              )
+            ))
+          ' website.json > website.enhanced.json
+          
+          mv website.enhanced.json website.json
+
+          echo "Enhanced website.json:"
+          jq '.' website.json
+
+          # Validate that we have a proper structure
+          if ! jq -e '.pages[0].blocks | length >= 2' website.json >/dev/null; then
+            echo "Warning: Generated config seems too simple, this might indicate AI generation issues"
+          fi
+
+      - name: Strip any prefilled image URLs if generating images
+        if: ${{ inputs.generate_images }}
+        run: |
+          set -euo pipefail
+          jq '
+            .hero.image = "" |
+            (.pages |= map(
+              .blocks |= map(
+                if .type == "gallery" then
+                  .images = ((.images // []) | map(.url = "" | .))
+                elif .type == "team" then
+                  .members = ((.members // []) | map(.photo = "" | .))
+                elif .type == "services" then
+                  .items = ((.items // []) | map(.icon = "" | .))
+                else .
+                end
+              )
+            ))
+          ' website.json > website.tmp.json
+          mv website.tmp.json website.json
+
+      - name: Authenticate to Google Cloud
+        if: ${{ inputs.generate_images == true }}
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Setup Google Cloud SDK
+        if: ${{ inputs.generate_images == true }}
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Generate images using Google Vertex AI Imagen
+        if: ${{ inputs.generate_images == true }}
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          CLOUDWAYS_HOST: ${{ secrets.CLOUDWAYS_HOST }}
+          CLOUDWAYS_USER: ${{ secrets.CLOUDWAYS_USER }}
+          CLOUDWAYS_SSH_KEY: ${{ secrets.CLOUDWAYS_SSH_KEY }}
+          APP_PATH: ${{ secrets.APP_PATH }}
+        run: |
+          set -euo pipefail
+          
+          # Set up SSH key
+          mkdir -p ~/.ssh
+          echo "$CLOUDWAYS_SSH_KEY" | tr -d '\r' > ~/.ssh/cw_id
+          chmod 600 ~/.ssh/cw_id
+          
+          # Verify SSH key format
+          if ! ssh-keygen -l -f ~/.ssh/cw_id >/dev/null 2>&1; then
+            echo "ERROR: SSH key format is invalid"
+            echo "First few lines of key:"
+            head -3 ~/.ssh/cw_id
+            exit 1
+          fi
+          
+          # Set up Google Cloud variables
+          LOCATION="us-central1"
+          MODEL="projects/${GCP_PROJECT_ID}/locations/${LOCATION}/publishers/google/models/imagen-3.0-generate-002"
+          BUCKET="sitefuse-assets"
+          ACCESS_TOKEN="$(gcloud auth print-access-token)"
+          
+          # Function to generate image using Vertex AI Imagen (matching your working version)
+          gen_image() {
+            local prompt="$1"
+            local width="${2:-1600}"
+            local height="${3:-800}"
+          
+            curl -sS \
+              -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "https://${LOCATION}-aiplatform.googleapis.com/v1/${MODEL}:predict" \
+              -d "{
+                    \"instances\": [{ \"prompt\": \"${prompt//\"/\\\"}\" }],
+                    \"parameters\": { \"sampleCount\": 1, \"sampleImageSize\": { \"width\": ${width}, \"height\": ${height} } }
+                  }" \
+            | jq -r '.predictions[0].bytesBase64Encoded' \
+            | base64 -d
+          }
+          
+          # gather context from website.json + workflow input
+          SITE_NAME="$(jq -r '.name // ""' website.json)"
+          HERO_TITLE="$(jq -r '.hero.title // ""' website.json)"
+          HERO_SUB="$(jq -r '.hero.subtitle // ""' website.json)"
+
+          RAW_PROMPT="${{ inputs.prompt }}"
+          IND="${{ inputs.industry }}"
+
+          # add controlled randomness for visual variety
+          STYLES=(
+            "abstract gradient background"
+            "soft bokeh photography"
+            "geometric pattern"
+            "minimal textured backdrop"
+            "calming nature scene"
+            "architectural lines"
+          )
+          STYLE="${STYLES[$RANDOM % ${#STYLES[@]}]}"
+
+          # build full prompt with strong anti-text cues
+          FULL_PROMPT="$RAW_PROMPT, industry: $IND, site: $SITE_NAME, hero: $HERO_TITLE, $HERO_SUB, $STYLE, website hero background, clean modern design, no people, NO text, NO words, NO typography, NO letters, NO watermark, NO logo"
+
+          # collapse newlines, escape quotes
+          FULL_PROMPT="$(printf "%s" "$FULL_PROMPT" | tr '\n' ' ')"
+          FULL_PROMPT_ESCAPED=${FULL_PROMPT//\"/\\\"}
+
+          echo "Imagen prompt:"
+          echo "$FULL_PROMPT"
+
+          # ---- generate hero image ----
+          echo "Generating hero image with Vertex AI Imagen..."
+          gen_image "$FULL_PROMPT_ESCAPED" 1600 800 > hero.png
+          
+          # Check if image was generated successfully
+          if [ -f "hero.png" ] && [ -s "hero.png" ]; then
+            echo "Hero image generated successfully"
+            ls -la hero.png
+            
+            # Upload to Google Cloud Storage
+            STAMP=$(date +%s)
+            echo "Uploading to Google Cloud Storage..."
+            gcloud storage cp hero.png "gs://${BUCKET}/hero-${STAMP}.png" \
+              --cache-control="public,max-age=31536000,immutable"
+            
+            # Create public URL
+            PUBLIC_URL="https://storage.googleapis.com/${BUCKET}/hero-${STAMP}.png"
+            echo "Public URL: $PUBLIC_URL"
+            
+            # Update website.json on Cloudways server
+            echo "Updating website.json with hero image URL..."
+            ssh -o StrictHostKeyChecking=no -i ~/.ssh/cw_id "${CLOUDWAYS_USER}@${CLOUDWAYS_HOST}" "
+              set -e
+              APP='${APP_PATH}'
+              tmp=\"\$APP/website.tmp\"
+              jq --arg url '${PUBLIC_URL}' '.hero.image = \$url' \"\$APP/website.json\" > \"\$tmp\" && mv \"\$tmp\" \"\$APP/website.json\"
+              echo 'HERO image URL set to: ${PUBLIC_URL}'
+              wp --path=\"\$APP\" breeze purge --allow-root --cache=all || true
+            "
+            
+            echo "Done! Hero image generated and deployed successfully"
+          else
+            echo "Failed to generate hero image"
+            exit 1
+          fi
+
+      - name: Validate image generation results
+        if: ${{ inputs.generate_images }}
+        run: |
+          set -euo pipefail
+          
+          echo "Checking image generation results..."
+          
+          # Count total expected vs populated images
+          hero_expected=$(jq -r 'if .hero then 1 else 0 end' website.json)
+          hero_populated=$(jq -r 'if .hero.image != "" and .hero.image != null then 1 else 0 end' website.json)
+          
+          gallery_expected=$(jq '[.pages[]?.blocks[]? | select(.type=="gallery") | .images[]?] | length' website.json)
+          gallery_populated=$(jq '[.pages[]?.blocks[]? | select(.type=="gallery") | .images[]? | select(.url != "" and .url != null)] | length' website.json)
+          
+          team_expected=$(jq '[.pages[]?.blocks[]? | select(.type=="team") | .members[]?] | length' website.json)
+          team_populated=$(jq '[.pages[]?.blocks[]? | select(.type=="team") | .members[]? | select(.photo != "" and .photo != null)] | length' website.json)
+          
+          services_expected=$(jq '[.pages[]?.blocks[]? | select(.type=="services") | .items[]?] | length' website.json)
+          services_populated=$(jq '[.pages[]?.blocks[]? | select(.type=="services") | .items[]? | select(.icon != "" and .icon != null)] | length' website.json)
+          
+          echo "Image generation summary:"
+          echo "Hero: $hero_populated/$hero_expected"
+          echo "Gallery: $gallery_populated/$gallery_expected"
+          echo "Team: $team_populated/$team_expected"
+          echo "Services: $services_populated/$services_expected"
+          
+          total_expected=$((hero_expected + gallery_expected + team_expected + services_expected))
+          total_populated=$((hero_populated + gallery_populated + team_populated + services_populated))
+          
+          echo "Total: $total_populated/$total_expected images generated"
+          
+          if [ "$total_populated" -lt "$total_expected" ]; then
+            echo "Warning: Some images failed to generate, but continuing deployment..."
+          else
+            echo "All images generated successfully!"
+          fi
+
+      - name: Upload configuration
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-config-${{ github.run_id }}
+          path: website.json
+          retention-days: 1
+          
